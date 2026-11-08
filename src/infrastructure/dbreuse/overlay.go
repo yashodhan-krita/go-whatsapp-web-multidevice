@@ -81,6 +81,18 @@ type OrphanRef struct {
 	ParentInvented     bool   `json:"parent_invented"`
 }
 
+// KeyCollision is a child row the table's unique key cannot store beside the kept row.
+// The alternate stays in the private audit. Relinked is always false.
+type KeyCollision struct {
+	Table        string   `json:"table"`
+	KeyColumns   []string `json:"key_columns"`
+	DeviceID     string   `json:"device_id"`
+	MessageID    string   `json:"message_id"`
+	KeptChatJID  string   `json:"kept_chat_jid"`
+	OtherChatJID string   `json:"other_chat_jid"`
+	Relinked     bool     `json:"relinked"`
+}
+
 // ChatDifference is target chat metadata that was not written over the source row.
 type ChatDifference struct {
 	DeviceID    string `json:"device_id"`
@@ -114,6 +126,7 @@ type OverlayReport struct {
 	DivergentRetained      int                `json:"divergent_retained"`
 	Orphans                []OrphanRef        `json:"orphans"`
 	AliasInferred          bool               `json:"alias_inferred"`
+	KeyCollisions          []KeyCollision     `json:"key_collisions"`
 	ChatDifferences        []ChatDifference   `json:"chat_differences"`
 	CutoverReady           bool               `json:"cutover_ready"`
 	HistoryComplete        bool               `json:"history_complete"`
@@ -127,15 +140,16 @@ type verifiedAccount struct {
 }
 
 type planned struct {
-	messages      []sqlRow
-	chats         []sqlRow
-	reactions     []sqlRow
-	edits         []sqlRow
-	polls         []sqlRow
-	fills         []columnFill
-	updates       []rowUpdate
-	auditMessages []auditMessage
-	auditOrphans  []auditOrphan
+	messages        []sqlRow
+	chats           []sqlRow
+	reactions       []sqlRow
+	edits           []sqlRow
+	polls           []sqlRow
+	fills           []columnFill
+	updates         []rowUpdate
+	auditMessages   []auditMessage
+	auditOrphans    []auditOrphan
+	auditCollisions []auditCollision
 }
 
 type rowUpdate struct {
@@ -257,7 +271,7 @@ func Overlay(ctx context.Context, req OverlayRequest) (*OverlayReport, error) {
 	}
 	report.AuditPath = auditPathFor(req.Out)
 	report.DivergentRetained = len(plan.auditMessages) / 2
-	if err := writeMigrationAudit(report.AuditPath, plan.auditMessages, plan.auditOrphans); err != nil {
+	if err := writeMigrationAudit(report.AuditPath, plan.auditMessages, plan.auditOrphans, plan.auditCollisions); err != nil {
 		return report, err
 	}
 	if err := publishOverlay(ctx, baseSnap, req.Out, plan); err != nil {
@@ -284,6 +298,7 @@ func newOverlayReport() *OverlayReport {
 		PreservedBaseDeviceIDs: []string{},
 		ColumnDiffs:            []ColumnDiff{},
 		Orphans:                []OrphanRef{},
+		KeyCollisions:          []KeyCollision{},
 		Policy:                 sourceAuthoritativePolicy,
 		AliasInferred:          false,
 		ChatDifferences:        []ChatDifference{},
@@ -687,6 +702,9 @@ func buildOverlayPlan(report *OverlayReport, srcDB, dstDB queryer, accounts []ve
 	if len(report.UnmappedDeviceIDs) > 0 {
 		report.Reasons = append(report.Reasons, "incoming history has unmapped device ids that are not in the account map: "+strings.Join(report.UnmappedDeviceIDs, ", "))
 	}
+	if len(report.KeyCollisions) > 0 {
+		report.Notes = append(report.Notes, "A child-table unique key that does not include chat_jid cannot store both chats. The staged row was not moved onto the other chat, and the full alternate row is in the private audit.")
+	}
 	if len(report.Ambiguous) > 0 {
 		report.Notes = append(report.Notes, "Message ids that appear under more than one chat are kept as separate rows. No LID or phone alias was inferred.")
 	}
@@ -806,16 +824,21 @@ func planChildren(report *OverlayReport, plan *planned, srcDB, dstDB queryer, ta
 		if err := sameHistoryColumns(srcRows, dstRows, spec.table); err != nil {
 			return err
 		}
-		existing := map[string]sqlRow{}
+		uniqueKeys, err := pragmaUniqueKeys(srcDB, spec.table)
+		if err != nil {
+			return err
+		}
+		if !keyListed(uniqueKeys, spec.key) {
+			return fmt.Errorf("%s unique keys do not include %v", spec.table, spec.key)
+		}
+		indexes := make([]map[string]sqlRow, len(uniqueKeys))
+		for i := range indexes {
+			indexes[i] = map[string]sqlRow{}
+		}
 		for _, row := range srcRows {
-			key, err := rowKey(row, spec.key)
-			if err != nil {
-				return err
+			if err := rememberRow(indexes, uniqueKeys, row); err != nil {
+				return fmt.Errorf("duplicate %s key: %w", spec.table, err)
 			}
-			if _, ok := existing[key]; ok {
-				return fmt.Errorf("duplicate %s key", spec.table)
-			}
-			existing[key] = row
 			if _, err := recordOrphan(report, plan, spec.table, parentColumn(spec.table), row, messages, baseOriginName(baseName), true); err != nil {
 				return err
 			}
@@ -834,10 +857,6 @@ func planChildren(report *OverlayReport, plan *planned, srcDB, dstDB queryer, ta
 			if err != nil {
 				return err
 			}
-			key, err := rowKey(rewritten, spec.key)
-			if err != nil {
-				return err
-			}
 			chat, _ := rowString(rewritten, "chat_jid")
 			id, _ := rowString(rewritten, spec.idCol)
 			messageID := id
@@ -851,46 +870,191 @@ func planChildren(report *OverlayReport, plan *planned, srcDB, dstDB queryer, ta
 					return err
 				}
 			}
+			occupied, occupiedKey, hit, err := findOccupied(indexes, uniqueKeys, rewritten)
+			if err != nil {
+				return err
+			}
+			if hit {
+				keptChat, err := rowString(occupied, "chat_jid")
+				if err != nil {
+					return err
+				}
+				if !containsColumn(occupiedKey, "chat_jid") && keptChat != chat {
+					report.KeyCollisions = append(report.KeyCollisions, KeyCollision{
+						Table: spec.table, KeyColumns: append([]string{}, occupiedKey...),
+						DeviceID: sourceDevice, MessageID: messageID,
+						KeptChatJID: keptChat, OtherChatJID: chat, Relinked: false,
+					})
+					plan.auditCollisions = append(plan.auditCollisions, auditCollision{
+						table: spec.table, device: sourceDevice, keptChat: keptChat, otherChat: chat,
+						messageID: messageID, kept: occupied, alternate: row,
+					})
+					continue
+				}
+				same, err := samePayload(occupied, rewritten)
+				if err != nil {
+					return err
+				}
+				if !same {
+					provenanceOnly, err := onlyProvenanceDiff(occupied, rewritten)
+					if err != nil {
+						return err
+					}
+					if provenanceOnly {
+						continue
+					}
+					report.Conflicts = append(report.Conflicts, RowConflict{Table: spec.table, DeviceID: sourceDevice, ChatJID: chat, ID: id, Class: "genuine_content"})
+					retainBoth(plan, occupied, row, baseName, sourceDevice, chat, id)
+					if baseName == "target" {
+						plan.updates = append(plan.updates, rowUpdate{table: spec.table, keys: spec.key, row: rewritten})
+					}
+				}
+				continue
+			}
 			parentKey := sourceDevice + "\x00" + chat + "\x00" + messageID
 			if _, ok := messages[parentKey]; !ok {
 				if _, err := recordOrphan(report, plan, spec.table, parentColumn(spec.table), row, nil, incomingOriginName(baseName), false); err != nil {
 					return err
 				}
-				if spec.allowOrphan {
-					*spec.assign = append(*spec.assign, rewritten)
-					report.Orphans[len(report.Orphans)-1].RetainedInStagedDB = true
-					plan.auditOrphans[len(plan.auditOrphans)-1].inStaged = true
-				}
-				continue
-			}
-			current, found := existing[key]
-			if !found {
-				*spec.assign = append(*spec.assign, rewritten)
-				existing[key] = rewritten
-				continue
-			}
-			same, err := samePayload(current, rewritten)
-			if err != nil {
-				return err
-			}
-			if !same {
-				provenanceOnly, err := onlyProvenanceDiff(current, rewritten)
-				if err != nil {
-					return err
-				}
-				if provenanceOnly {
+				if !spec.allowOrphan {
 					continue
 				}
-				report.Conflicts = append(report.Conflicts, RowConflict{Table: spec.table, DeviceID: sourceDevice, ChatJID: chat, ID: id, Class: "genuine_content"})
-				retainBoth(plan, current, row, baseName, sourceDevice, chat, id)
-				if baseName == "target" {
-					plan.updates = append(plan.updates, rowUpdate{table: spec.table, keys: spec.key, row: rewritten})
+				*spec.assign = append(*spec.assign, rewritten)
+				report.Orphans[len(report.Orphans)-1].RetainedInStagedDB = true
+				plan.auditOrphans[len(plan.auditOrphans)-1].inStaged = true
+				if err := rememberRow(indexes, uniqueKeys, rewritten); err != nil {
+					return err
 				}
+				continue
+			}
+			*spec.assign = append(*spec.assign, rewritten)
+			if err := rememberRow(indexes, uniqueKeys, rewritten); err != nil {
+				return err
 			}
 		}
 		*spec.counter = len(*spec.assign)
 	}
 	return nil
+}
+
+func pragmaUniqueKeys(q queryer, table string) ([][]string, error) {
+	quoted, err := quoteIdent(table)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := q.Query(fmt.Sprintf(`PRAGMA index_list(%s)`, quoted))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var seq, unique, partial int
+		var name, origin string
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			return nil, err
+		}
+		if unique == 0 {
+			continue
+		}
+		if partial != 0 {
+			return nil, fmt.Errorf("%s has partial unique index %s; refusing to guess which rows it covers", table, name)
+		}
+		names = append(names, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	var keys [][]string
+	for _, name := range names {
+		quotedName, err := quoteIdent(name)
+		if err != nil {
+			return nil, err
+		}
+		info, err := q.Query(fmt.Sprintf(`PRAGMA index_info(%s)`, quotedName))
+		if err != nil {
+			return nil, err
+		}
+		var cols []string
+		for info.Next() {
+			var seqno, cid int
+			var col string
+			if err := info.Scan(&seqno, &cid, &col); err != nil {
+				info.Close()
+				return nil, err
+			}
+			cols = append(cols, col)
+		}
+		if err := info.Err(); err != nil {
+			info.Close()
+			return nil, err
+		}
+		info.Close()
+		if len(cols) == 0 {
+			return nil, fmt.Errorf("%s unique index %s has no columns", table, name)
+		}
+		keys = append(keys, cols)
+	}
+	if len(keys) == 0 {
+		return nil, fmt.Errorf("%s has no unique key", table)
+	}
+	return keys, nil
+}
+
+func rememberRow(indexes []map[string]sqlRow, keys [][]string, row sqlRow) error {
+	for i, cols := range keys {
+		key, err := rowKey(row, cols)
+		if err != nil {
+			return err
+		}
+		if _, ok := indexes[i][key]; ok {
+			return fmt.Errorf("key %s", strings.Join(cols, ","))
+		}
+		indexes[i][key] = row
+	}
+	return nil
+}
+
+func findOccupied(indexes []map[string]sqlRow, keys [][]string, row sqlRow) (sqlRow, []string, bool, error) {
+	for i, cols := range keys {
+		key, err := rowKey(row, cols)
+		if err != nil {
+			return sqlRow{}, nil, false, err
+		}
+		if found, ok := indexes[i][key]; ok {
+			return found, cols, true, nil
+		}
+	}
+	return sqlRow{}, nil, false, nil
+}
+
+func keyListed(keys [][]string, want []string) bool {
+	for _, cols := range keys {
+		if sameStringSet(cols, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func sameStringSet(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	a := append([]string{}, left...)
+	b := append([]string{}, right...)
+	sort.Strings(a)
+	sort.Strings(b)
+	return sameStrings(a, b)
+}
+
+func containsColumn(cols []string, name string) bool {
+	for _, col := range cols {
+		if col == name {
+			return true
+		}
+	}
+	return false
 }
 
 func readHistory(db queryer, table string) ([]sqlRow, error) {

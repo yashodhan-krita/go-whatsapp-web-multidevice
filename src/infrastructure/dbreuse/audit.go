@@ -34,7 +34,17 @@ type auditOrphan struct {
 	inStaged bool
 }
 
-func writeMigrationAudit(path string, messages []auditMessage, orphans []auditOrphan) error {
+type auditCollision struct {
+	table     string
+	device    string
+	keptChat  string
+	otherChat string
+	messageID string
+	kept      sqlRow
+	alternate sqlRow
+}
+
+func writeMigrationAudit(path string, messages []auditMessage, orphans []auditOrphan, collisions []auditCollision) error {
 	if _, err := os.Stat(path); err == nil {
 		return fmt.Errorf("audit file already exists: %s", path)
 	}
@@ -66,6 +76,16 @@ func writeMigrationAudit(path string, messages []auditMessage, orphans []auditOr
 			retained_in_staged_db INTEGER NOT NULL,
 			parent_invented INTEGER NOT NULL,
 			row_json TEXT NOT NULL
+		)`,
+		`CREATE TABLE key_collisions (
+			table_name TEXT NOT NULL,
+			device_id TEXT NOT NULL,
+			kept_chat_jid TEXT NOT NULL,
+			alternate_chat_jid TEXT NOT NULL,
+			message_id TEXT NOT NULL,
+			relinked INTEGER NOT NULL,
+			kept_row_json TEXT NOT NULL,
+			alternate_row_json TEXT NOT NULL
 		)`,
 		`CREATE TABLE archive_messages (
 			archive_path TEXT NOT NULL,
@@ -114,6 +134,23 @@ func writeMigrationAudit(path string, messages []auditMessage, orphans []auditOr
 		}
 		if _, err := tx.Exec(`INSERT INTO orphan_rows (table_name, device_id, chat_jid, message_id, origin, retained_in_staged_db, parent_invented, row_json) VALUES (?, ?, ?, ?, ?, ?, 0, ?)`,
 			orphan.table, orphan.device, orphan.chat, orphan.id, orphan.origin, kept, raw); err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+	for _, collision := range collisions {
+		kept, err := privateRowJSON(collision.kept)
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+		alternate, err := privateRowJSON(collision.alternate)
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+		if _, err := tx.Exec(`INSERT INTO key_collisions (table_name, device_id, kept_chat_jid, alternate_chat_jid, message_id, relinked, kept_row_json, alternate_row_json) VALUES (?, ?, ?, ?, ?, 0, ?, ?)`,
+			collision.table, collision.device, collision.keptChat, collision.otherChat, collision.messageID, kept, alternate); err != nil {
 			tx.Rollback()
 			return err
 		}
@@ -182,6 +219,10 @@ func rowsInAudit(path, needle string) (bool, error) {
 			SELECT row_json FROM orphan_rows
 			UNION ALL
 			SELECT raw_json FROM archive_messages
+			UNION ALL
+			SELECT kept_row_json FROM key_collisions
+			UNION ALL
+			SELECT alternate_row_json FROM key_collisions
 		) WHERE body LIKE ?`, "%"+needle+"%").Scan(&n)
 	if err != nil {
 		return false, err

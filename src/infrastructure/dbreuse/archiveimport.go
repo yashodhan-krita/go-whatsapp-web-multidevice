@@ -319,7 +319,7 @@ func ensureAudit(path string) error {
 	} else if !os.IsNotExist(err) {
 		return err
 	}
-	return writeMigrationAudit(path, nil, nil)
+	return writeMigrationAudit(path, nil, nil, nil)
 }
 
 func resolveImportAccount(explicit string, archives []string, slots []RegistrySlot) (string, error) {

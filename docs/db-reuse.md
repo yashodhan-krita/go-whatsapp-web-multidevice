@@ -203,9 +203,17 @@ incoming device id that is not in the map still leaves `--out` uncreated.
 Chat name differences are reported and the base chat row is kept.
 
 A reaction or poll whose message row is absent is inserted as itself when
-the table has no foreign key. The parent message is not invented. An edit
-with no parent cannot be inserted, because `message_edits` references
-`messages`; that row is kept in the audit instead.
+the table has no foreign key and its unique key is free. The parent message
+is not invented. An edit with no parent cannot be inserted, because
+`message_edits` references `messages`; that row is kept in the audit instead.
+
+`message_reactions` is unique on `(message_id, reactor_jid, device_id)`.
+That key does not include `chat_jid`, and `message_edits` is unique on
+`(original_message_id, edit_event_id, device_id)`. The same key in two chats
+cannot both be inserted. The staged row stays on the chat it already has.
+It is not moved. The other full row is written to the private audit.
+`poll_definitions` and `messages` include `chat_jid` in their primary keys,
+so those rows stay separate.
 
 `"applied": true` means the staged file was written. It does not mean the
 file is ready to install. `cutover_ready` and `history_complete` stay false.

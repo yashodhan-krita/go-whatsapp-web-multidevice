@@ -975,6 +975,237 @@ func TestOverlayKeepsOrphanReactionAndSourcePrimaryOnTargetBase(t *testing.T) {
 	}
 }
 
+func TestChildUniqueKeysKeepBothChatsWithoutRelinking(t *testing.T) {
+	db, _ := newSchemaDB(t)
+	constraints := uniqueColumns(t, db, "message_reactions")
+	if !sameStringSet(constraints, []string{"message_id", "reactor_jid", "device_id"}) {
+		t.Fatalf("reaction unique key %v", constraints)
+	}
+	if len(foreignKeyColumns(t, db, "message_reactions").from) != 0 {
+		t.Fatal("reaction foreign keys changed")
+	}
+	editKey := uniqueColumns(t, db, "message_edits")
+	if !sameStringSet(editKey, []string{"original_message_id", "edit_event_id", "device_id"}) {
+		t.Fatalf("edit unique key %v", editKey)
+	}
+	editFK := foreignKeyColumns(t, db, "message_edits")
+	if !sameStringSet(editFK.from, []string{"original_message_id", "chat_jid", "device_id"}) || editFK.refTable != "messages" || !sameStringSet(editFK.to, []string{"id", "chat_jid", "device_id"}) {
+		t.Fatalf("edit fk %+v", editFK)
+	}
+	if !sameStringSet(uniqueColumns(t, db, "poll_definitions"), []string{"device_id", "chat_jid", "poll_message_id"}) {
+		t.Fatal("poll key changed")
+	}
+	if !sameStringSet(uniqueColumns(t, db, "messages"), []string{"id", "chat_jid", "device_id"}) {
+		t.Fatal("message key changed")
+	}
+	if len(foreignKeyColumns(t, db, "messages").from) != 0 || len(foreignKeyColumns(t, db, "poll_definitions").from) != 0 {
+		t.Fatal("message or poll foreign keys changed")
+	}
+	if !sameStringSet(uniqueColumns(t, db, "chats"), []string{"jid", "device_id"}) || len(foreignKeyColumns(t, db, "chats").from) != 0 {
+		t.Fatal("chat key changed")
+	}
+	db.Close()
+
+	src, srcPath := newSchemaDB(t)
+	if _, err := src.Exec(`INSERT INTO devices (device_id, display_name, jid, ad_jid) VALUES ('slot-src', 'synthetic', '999001@lid', '15550001000:4@s.whatsapp.net')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := src.Exec(`INSERT INTO chats (jid, device_id, name, last_message_time) VALUES ('15550002000@s.whatsapp.net', '999001@lid', 'synthetic peer', '2026-01-02 03:04:05'), ('15550003000@s.whatsapp.net', '999001@lid', 'second chat', '2026-04-04 00:00:00')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := src.Exec(`INSERT INTO messages (id, chat_jid, device_id, sender, content, timestamp, is_from_me) VALUES ('synthetic-m1', '15550003000@s.whatsapp.net', '999001@lid', '15550003000@s.whatsapp.net', 'other occurrence', '2026-04-04 00:00:00', 0), ('synthetic-m2', '15550002000@s.whatsapp.net', '999001@lid', '15550002000@s.whatsapp.net', 'same chat', '2026-04-05 00:00:00', 0)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := src.Exec(`INSERT INTO message_reactions (message_id, chat_jid, device_id, reactor_jid, emoji, reaction_timestamp) VALUES ('synthetic-m1', '15550003000@s.whatsapp.net', '999001@lid', '15550002000@s.whatsapp.net', 'other-chat-emoji', '2026-04-04 00:01:00'), ('synthetic-m2', '15550002000@s.whatsapp.net', '999001@lid', '15550002000@s.whatsapp.net', 'source-emoji', '2026-04-05 00:01:00')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := src.Exec(`INSERT INTO message_edits (original_message_id, edit_event_id, chat_jid, device_id, edited_at, previous_content, new_content) VALUES ('synthetic-m1', 'synthetic-e1', '15550003000@s.whatsapp.net', '999001@lid', '2026-04-04 00:02:00', 'left', 'right'), ('synthetic-missing-parent', 'synthetic-e-orphan', '15550002000@s.whatsapp.net', '999001@lid', '2026-04-04 00:03:00', 'orphan-left', 'orphan-right')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := src.Exec(`INSERT INTO poll_definitions (device_id, chat_jid, poll_message_id, question) VALUES ('999001@lid', '15550003000@s.whatsapp.net', 'synthetic-m1', 'other poll'), ('999001@lid', '15550002000@s.whatsapp.net', 'synthetic-m2', 'source question')`); err != nil {
+		t.Fatal(err)
+	}
+	src.Close()
+
+	dst, dstPath := newSchemaDB(t)
+	insertSyntheticHistory(t, dst)
+	freezeClocks(t, dst)
+	if _, err := dst.Exec(`INSERT INTO devices (device_id, display_name, jid, ad_jid) VALUES ('synthetic-slot-b', 'synthetic b', '15550004000@s.whatsapp.net', '15550004000:1@s.whatsapp.net')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dst.Exec(`INSERT INTO chats (jid, device_id, name, last_message_time) VALUES ('15550002000@s.whatsapp.net', '15550004000@s.whatsapp.net', 'kept account', '2026-04-04 00:00:00')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dst.Exec(`INSERT INTO messages (id, chat_jid, device_id, sender, content, timestamp, is_from_me, created_at, updated_at) VALUES ('synthetic-kept', '15550002000@s.whatsapp.net', '15550004000@s.whatsapp.net', '15550002000@s.whatsapp.net', 'kept body', '2026-04-04 00:00:00', 0, '2026-01-02 03:04:05', '2026-01-02 03:04:05')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dst.Exec(`INSERT INTO message_reactions (message_id, chat_jid, device_id, reactor_jid, emoji, reaction_timestamp, created_at, updated_at) VALUES ('synthetic-kept', '15550002000@s.whatsapp.net', '15550004000@s.whatsapp.net', '15550002000@s.whatsapp.net', 'kept-account', '2026-04-04 00:01:00', '2026-01-02 03:04:05', '2026-01-02 03:04:05')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dst.Exec(`INSERT INTO messages (id, chat_jid, device_id, sender, content, timestamp, is_from_me, created_at, updated_at) VALUES ('synthetic-m2', '15550002000@s.whatsapp.net', '15550001000@s.whatsapp.net', '15550002000@s.whatsapp.net', 'same chat', '2026-04-05 00:00:00', 0, '2026-01-02 03:04:05', '2026-01-02 03:04:05')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dst.Exec(`INSERT INTO message_reactions (message_id, chat_jid, device_id, reactor_jid, emoji, reaction_timestamp, created_at, updated_at) VALUES ('synthetic-m2', '15550002000@s.whatsapp.net', '15550001000@s.whatsapp.net', '15550002000@s.whatsapp.net', 'base-emoji', '2026-04-05 00:01:00', '2026-01-02 03:04:05', '2026-01-02 03:04:05')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dst.Exec(`INSERT INTO poll_definitions (device_id, chat_jid, poll_message_id, question, created_at, updated_at) VALUES ('15550001000@s.whatsapp.net', '15550002000@s.whatsapp.net', 'synthetic-m2', 'base question', '2026-01-02 03:04:05', '2026-01-02 03:04:05')`); err != nil {
+		t.Fatal(err)
+	}
+	dst.Close()
+	srcSum, dstSum := fileSum(t, srcPath), fileSum(t, dstPath)
+	mapping := writeMap(t, AccountMapping{
+		Label: "synthetic-a", Phone: "15550001000", LID: "999001",
+		SourceStorageJID: "999001@lid", TargetStorageJID: "15550001000@s.whatsapp.net",
+	})
+	out := filepath.Join(t.TempDir(), "union.db")
+	report, err := Overlay(context.Background(), OverlayRequest{
+		Source: srcPath, Target: dstPath, MapPath: mapping, WorkDir: t.TempDir(), Out: out, Base: "target",
+	})
+	if err != nil || !report.Applied || report.HistoryComplete || report.AliasInferred {
+		t.Fatalf("overlay %+v %v", report, err)
+	}
+	if fileSum(t, srcPath) != srcSum || fileSum(t, dstPath) != dstSum {
+		t.Fatal("originals changed")
+	}
+	encoded, _ := json.Marshal(report)
+	for _, hidden := range []string{"source-emoji", "other-chat-emoji", "other-chat body", "orphan-right", "source question", "kept body"} {
+		if strings.Contains(string(encoded), hidden) {
+			t.Fatalf("public report contains %s", hidden)
+		}
+	}
+	var reactionHits, editHits int
+	for _, collision := range report.KeyCollisions {
+		if collision.Relinked {
+			t.Fatalf("relinked %+v", collision)
+		}
+		if collision.Table == "message_reactions" && collision.MessageID == "synthetic-m1" {
+			reactionHits++
+			if !sameStringSet(collision.KeyColumns, []string{"message_id", "reactor_jid", "device_id"}) {
+				t.Fatalf("collision key %v", collision.KeyColumns)
+			}
+		}
+		if collision.Table == "message_edits" && collision.OtherChatJID == "15550003000@s.whatsapp.net" {
+			editHits++
+		}
+	}
+	if reactionHits != 1 || editHits != 1 {
+		t.Fatalf("collisions %+v", report.KeyCollisions)
+	}
+	staged, err := sql.Open(sqlite.DriverName, out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer staged.Close()
+	var emoji, chat string
+	var reactionCount, editCount, pollCount, messageCount, orphanEdits, invented, kept int
+	var question, keptEmoji string
+	if err := staged.QueryRow(`SELECT COUNT(*), emoji, chat_jid FROM message_reactions WHERE message_id='synthetic-m1' AND reactor_jid='15550002000@s.whatsapp.net' AND device_id='15550001000@s.whatsapp.net'`).Scan(&reactionCount, &emoji, &chat); err != nil {
+		t.Fatal(err)
+	}
+	if reactionCount != 1 || emoji != "ok" || chat != "15550002000@s.whatsapp.net" {
+		t.Fatalf("reaction count %d emoji %q chat %q", reactionCount, emoji, chat)
+	}
+	var sameChatEmoji string
+	if err := staged.QueryRow(`SELECT emoji FROM message_reactions WHERE message_id='synthetic-m2' AND device_id='15550001000@s.whatsapp.net'`).Scan(&sameChatEmoji); err != nil || sameChatEmoji != "source-emoji" {
+		t.Fatalf("same-chat emoji %q %v", sameChatEmoji, err)
+	}
+	if err := staged.QueryRow(`SELECT COUNT(*) FROM message_edits WHERE original_message_id='synthetic-m1' AND edit_event_id='synthetic-e1' AND device_id='15550001000@s.whatsapp.net' AND chat_jid='15550002000@s.whatsapp.net'`).Scan(&editCount); err != nil || editCount != 1 {
+		t.Fatalf("edit %d %v", editCount, err)
+	}
+	if err := staged.QueryRow(`SELECT COUNT(*) FROM message_edits WHERE original_message_id='synthetic-missing-parent'`).Scan(&orphanEdits); err != nil || orphanEdits != 0 {
+		t.Fatalf("orphan edit %d %v", orphanEdits, err)
+	}
+	if err := staged.QueryRow(`SELECT COUNT(*) FROM messages WHERE id='synthetic-missing-parent'`).Scan(&invented); err != nil || invented != 0 {
+		t.Fatalf("invented parent %d %v", invented, err)
+	}
+	if err := staged.QueryRow(`SELECT COUNT(*) FROM poll_definitions WHERE poll_message_id='synthetic-m1' AND device_id='15550001000@s.whatsapp.net'`).Scan(&pollCount); err != nil || pollCount != 2 {
+		t.Fatalf("polls %d %v", pollCount, err)
+	}
+	if err := staged.QueryRow(`SELECT question FROM poll_definitions WHERE poll_message_id='synthetic-m2' AND chat_jid='15550002000@s.whatsapp.net'`).Scan(&question); err != nil || question != "source question" {
+		t.Fatalf("question %q %v", question, err)
+	}
+	if err := staged.QueryRow(`SELECT COUNT(*) FROM messages WHERE id='synthetic-m1' AND device_id='15550001000@s.whatsapp.net'`).Scan(&messageCount); err != nil || messageCount != 2 {
+		t.Fatalf("messages %d %v", messageCount, err)
+	}
+	if err := staged.QueryRow(`SELECT emoji FROM message_reactions WHERE message_id='synthetic-kept'`).Scan(&keptEmoji); err != nil || keptEmoji != "kept-account" {
+		t.Fatalf("preserved reaction %q %v", keptEmoji, err)
+	}
+	if err := staged.QueryRow(`SELECT COUNT(*) FROM messages WHERE id='synthetic-kept'`).Scan(&kept); err != nil || kept != 1 {
+		t.Fatalf("preserved message %d %v", kept, err)
+	}
+	for _, needle := range []string{"other-chat-emoji", "right", "orphan-right"} {
+		ok, err := rowsInAudit(report.AuditPath, needle)
+		if err != nil || !ok {
+			t.Fatalf("audit missing %s (%v)", needle, err)
+		}
+	}
+}
+
+type foreignKey struct {
+	from     []string
+	to       []string
+	refTable string
+}
+
+func uniqueColumns(t *testing.T, db *sql.DB, table string) []string {
+	t.Helper()
+	rows, err := db.Query(fmt.Sprintf(`PRAGMA index_list(%s)`, table))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var uniqueName string
+	for rows.Next() {
+		var seq, unique, partial int
+		var name, origin string
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			t.Fatal(err)
+		}
+		if unique == 1 && origin == "pk" {
+			uniqueName = name
+		}
+	}
+	if uniqueName == "" {
+		t.Fatalf("%s has no primary key", table)
+	}
+	info, err := db.Query(fmt.Sprintf(`PRAGMA index_info(%s)`, uniqueName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer info.Close()
+	var cols []string
+	for info.Next() {
+		var seqno, cid int
+		var col string
+		if err := info.Scan(&seqno, &cid, &col); err != nil {
+			t.Fatal(err)
+		}
+		cols = append(cols, col)
+	}
+	return cols
+}
+
+func foreignKeyColumns(t *testing.T, db *sql.DB, table string) foreignKey {
+	t.Helper()
+	rows, err := db.Query(fmt.Sprintf(`PRAGMA foreign_key_list(%s)`, table))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var fk foreignKey
+	for rows.Next() {
+		var id, seq int
+		var ref, from, to, onUpdate, onDelete, match string
+		if err := rows.Scan(&id, &seq, &ref, &from, &to, &onUpdate, &onDelete, &match); err != nil {
+			t.Fatal(err)
+		}
+		fk.refTable = ref
+		fk.from = append(fk.from, from)
+		fk.to = append(fk.to, to)
+	}
+	return fk
+}
+
 func TestImportArchiveInsertsAbsentMessagesOnly(t *testing.T) {
 	db, path := newSchemaDB(t)
 	insertSyntheticHistory(t, db)
