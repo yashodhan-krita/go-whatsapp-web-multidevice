@@ -255,6 +255,36 @@ func init() {
 			return nil
 		},
 	}
+	importCmd := &cobra.Command{
+		Use:   "import-archive",
+		Short: "Insert absent history-sync messages into a staged snapshot",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			path, _ := cmd.Flags().GetString("db")
+			account, _ := cmd.Flags().GetString("account")
+			audit, _ := cmd.Flags().GetString("audit")
+			archives, _ := cmd.Flags().GetStringArray("archive")
+			report, err := dbreuse.ImportArchives(dbreuse.ImportRequest{DB: path, Account: account, Audit: audit, Archives: archives})
+			if report != nil {
+				if writeErr := writeJSON(cmd.OutOrStdout(), report); writeErr != nil {
+					return writeErr
+				}
+			}
+			if err != nil {
+				return err
+			}
+			if report != nil && (report.HistoryComplete || report.MetadataOnlyIsProof) {
+				return fmt.Errorf("import-archive must not claim complete history")
+			}
+			return nil
+		},
+	}
+	importCmd.Flags().String("db", "", "staged chatstorage snapshot")
+	importCmd.Flags().String("account", "", "registry storage JID")
+	importCmd.Flags().String("audit", "", "private audit database")
+	importCmd.Flags().StringArray("archive", nil, "history-sync JSON file")
+	dbReuseCmd.AddCommand(importCmd)
+
 	coverageCmd.Flags().String("db", "", "chatstorage snapshot")
 	coverageCmd.Flags().StringArray("archive", nil, "history-sync JSON file")
 	dbReuseCmd.AddCommand(coverageCmd)

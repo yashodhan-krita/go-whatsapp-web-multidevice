@@ -216,7 +216,16 @@ type historyArchive struct {
 	EmptyConversations    int
 	TopLevel              []string
 	Messages              []ArchiveMessage
+	Payloads              []archivePayload
 	StatusMessagesPresent bool
+}
+
+// archivePayload keeps one raw history message for the private audit.
+// Coverage reports do not include it.
+type archivePayload struct {
+	ChatJID string
+	ID      string
+	Raw     json.RawMessage
 }
 
 func knownHistoryKey(key string) bool {
@@ -348,14 +357,21 @@ func decodeConversations(path string, dec *json.Decoder, parsed *historyArchive)
 				} `json:"key"`
 			} `json:"message"`
 		}
+		var rawItems []json.RawMessage
 		if err := json.Unmarshal(rawMessages, &items); err != nil {
 			return fmt.Errorf("%s conversation %s: %w", path, chat, err)
+		}
+		if err := json.Unmarshal(rawMessages, &rawItems); err != nil {
+			return fmt.Errorf("%s conversation %s: %w", path, chat, err)
+		}
+		if len(items) != len(rawItems) {
+			return fmt.Errorf("%s conversation %s message list could not be retained", path, chat)
 		}
 		if len(items) == 0 {
 			parsed.EmptyConversations++
 			continue
 		}
-		for _, item := range items {
+		for i, item := range items {
 			id := item.Message.Key.ID
 			remote := item.Message.Key.RemoteJID
 			if id == "" {
@@ -372,6 +388,7 @@ func decodeConversations(path string, dec *json.Decoder, parsed *historyArchive)
 				return fmt.Errorf("%s message %s chat id %s disagrees with remoteJid %s", path, id, chat, remote)
 			}
 			parsed.Messages = append(parsed.Messages, ArchiveMessage{ChatJID: messageChat, ID: id})
+			parsed.Payloads = append(parsed.Payloads, archivePayload{ChatJID: messageChat, ID: id, Raw: append(json.RawMessage(nil), rawItems[i]...)})
 		}
 	}
 	end, err := dec.Token()

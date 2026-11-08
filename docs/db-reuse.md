@@ -190,18 +190,22 @@ storage id is the declared JID, and that row's `ad_jid` must confirm `phone`.
 A declared `lid` must be one of the two storage JIDs. The inserted message's
 `device_id` becomes the base storage JID. Chat JIDs are not rewritten.
 
-Rows that already exist on both sides are classified by column. `created_at`
-and `updated_at` stay as the base wrote them. A different `timestamp` with
-the same content stays as the base wrote it, and both times are reported.
-An empty base metadata column can be filled from the incoming row. Content,
-sender, `is_from_me`, file hashes, and `media_key` differences are genuine
-conflicts. If one side's content is an edit row's previous content and the
-other side is that row's new content, the class is `edit_divergence`. Either
-class is unresolved: the report names the columns and does not include the
-text, the hash, or the key, and `--out` is not created. A message id stored
-under two chats, or an incoming device id missing from the map, also leaves
-`--out` uncreated. Chat name differences are reported and the base chat row
-is kept.
+Identity is the account storage JID plus the chat JID plus the message id.
+The same message id under another chat is a separate row. No LID or phone
+alias is inferred from that, and it does not block the staged file.
+
+For one account, one chat, and one message id, the source row is the staged
+primary. The other full row, including its text and media fields, is written
+to `<out>.migration-audit.db` and is not copied into the printed report.
+`created_at` and `updated_at` alone do not replace a row. An empty metadata
+column can still be filled when the rows are not a payload divergence. An
+incoming device id that is not in the map still leaves `--out` uncreated.
+Chat name differences are reported and the base chat row is kept.
+
+A reaction or poll whose message row is absent is inserted as itself when
+the table has no foreign key. The parent message is not invented. An edit
+with no parent cannot be inserted, because `message_edits` references
+`messages`; that row is kept in the audit instead.
 
 `"applied": true` means the staged file was written. It does not mean the
 file is ready to install. `cutover_ready` and `history_complete` stay false.
@@ -223,7 +227,23 @@ that omits `messages` increments `empty_conversations` and does not fail the
 file. `kind` `metadata_only` with `message_audit` false means the file had
 no conversations array; status, push-name, and progress files are that kind.
 None of those counts set `history_complete`. `old_bridge_assessed` stays
-false. Do not purge a bridge, archive, or target snapshot from this report.
+false. An id under another chat is a separate occurrence, not a row to drop.
+Do not purge a bridge, archive, or target snapshot from this report.
+
+Absent archive messages can be inserted into the staged snapshot. The
+account is the filename JID when it matches one registry storage id, or
+`--account` when the filename has no JID. A filename JID that matches a
+different account is refused. Rows that already exist for that account,
+chat, and id are left unchanged. The raw history object is appended to the
+private audit. Metadata-only files add nothing and are not proof. A legacy
+dry run of 908 keys, excluding broadcasts and newsletters, is not full
+legacy history; the old bridge still needs its own export and account map.
+
+```sh
+./db-reuse-linux-amd64 import-archive \
+  --db /absolute/path/to/work/staged.db \
+  --archive /absolute/path/to/history-1-ACCOUNT@s.whatsapp.net-1-RECENT.json
+```
 
 ## Message-referenced media
 
@@ -237,7 +257,9 @@ false. Do not purge a bridge, archive, or target snapshot from this report.
 The report's `subset_proven`, `whole_tree_copy_allowed`, `purge_allowed`,
 and `history_complete` fields are false. `bytes_selected` is null. Passing
 `--media-root` is an error; the command does not compare display names with
-a directory. History staging does not wait on this manifest.
+a directory. The 129.21 GB tree and 49.21 GB of free space on the box remain
+an independent blocker. History staging does not copy that tree, and a
+display filename is still not a path.
 
 A later adapter can prove a subset only by showing, for each file it selects:
 the account storage JID, chat JID, message id, a relative path that is not

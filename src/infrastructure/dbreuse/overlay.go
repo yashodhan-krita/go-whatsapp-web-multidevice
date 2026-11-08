@@ -3,6 +3,7 @@ package dbreuse
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -69,6 +70,17 @@ type AmbiguousMessage struct {
 	ChatJIDs []string `json:"chat_jids"`
 }
 
+// OrphanRef is a child row whose parent message is absent. The parent is not invented.
+type OrphanRef struct {
+	Table              string `json:"table"`
+	DeviceID           string `json:"device_id"`
+	ChatJID            string `json:"chat_jid"`
+	MessageID          string `json:"message_id"`
+	Origin             string `json:"origin"`
+	RetainedInStagedDB bool   `json:"retained_in_staged_db"`
+	ParentInvented     bool   `json:"parent_invented"`
+}
+
 // ChatDifference is target chat metadata that was not written over the source row.
 type ChatDifference struct {
 	DeviceID    string `json:"device_id"`
@@ -97,6 +109,11 @@ type OverlayReport struct {
 	Base                   string             `json:"base"`
 	ColumnDiffs            []ColumnDiff       `json:"column_diffs"`
 	EnrichmentFills        int                `json:"enrichment_fills"`
+	Policy                 string             `json:"policy"`
+	AuditPath              string             `json:"audit_path,omitempty"`
+	DivergentRetained      int                `json:"divergent_retained"`
+	Orphans                []OrphanRef        `json:"orphans"`
+	AliasInferred          bool               `json:"alias_inferred"`
 	ChatDifferences        []ChatDifference   `json:"chat_differences"`
 	CutoverReady           bool               `json:"cutover_ready"`
 	HistoryComplete        bool               `json:"history_complete"`
@@ -110,12 +127,21 @@ type verifiedAccount struct {
 }
 
 type planned struct {
-	messages  []sqlRow
-	chats     []sqlRow
-	reactions []sqlRow
-	edits     []sqlRow
-	polls     []sqlRow
-	fills     []columnFill
+	messages      []sqlRow
+	chats         []sqlRow
+	reactions     []sqlRow
+	edits         []sqlRow
+	polls         []sqlRow
+	fills         []columnFill
+	updates       []rowUpdate
+	auditMessages []auditMessage
+	auditOrphans  []auditOrphan
+}
+
+type rowUpdate struct {
+	table string
+	keys  []string
+	row   sqlRow
 }
 
 // Overlay writes a new database. Source and target paths are not modified.
@@ -220,6 +246,7 @@ func Overlay(ctx context.Context, req OverlayRequest) (*OverlayReport, error) {
 	} else {
 		report.Notes = append(report.Notes, "Base is the source registry. An account that exists only on the target cannot be mapped and blocks this direction.")
 	}
+	report.Notes = append(report.Notes, "Policy "+sourceAuthoritativePolicy+": for the same account, chat, and message id, the source row is the staged primary. The other full row is written only to the private audit file. Ids under more than one chat stay separate. No LID alias is inferred.")
 	plan, err := buildOverlayPlan(report, baseDB, incomingDB, verified, baseName)
 	if err != nil {
 		report.Reasons = append(report.Reasons, err.Error())
@@ -228,10 +255,16 @@ func Overlay(ctx context.Context, req OverlayRequest) (*OverlayReport, error) {
 	if rejected(report) {
 		return report, ErrRejected
 	}
+	report.AuditPath = auditPathFor(req.Out)
+	report.DivergentRetained = len(plan.auditMessages) / 2
+	if err := writeMigrationAudit(report.AuditPath, plan.auditMessages, plan.auditOrphans); err != nil {
+		return report, err
+	}
 	if err := publishOverlay(ctx, baseSnap, req.Out, plan); err != nil {
 		os.Remove(req.Out)
 		os.Remove(req.Out + "-wal")
 		os.Remove(req.Out + "-shm")
+		os.Remove(report.AuditPath)
 		report.Reasons = append(report.Reasons, err.Error())
 		return report, err
 	}
@@ -250,6 +283,9 @@ func newOverlayReport() *OverlayReport {
 		UnmappedDeviceIDs:      []string{},
 		PreservedBaseDeviceIDs: []string{},
 		ColumnDiffs:            []ColumnDiff{},
+		Orphans:                []OrphanRef{},
+		Policy:                 sourceAuthoritativePolicy,
+		AliasInferred:          false,
 		ChatDifferences:        []ChatDifference{},
 		Reasons:                []string{},
 		CutoverReady:           false,
@@ -601,6 +637,10 @@ func buildOverlayPlan(report *OverlayReport, srcDB, dstDB queryer, accounts []ve
 		report.ColumnDiffs = append(report.ColumnDiffs, diffs...)
 		if conflict != nil {
 			report.Conflicts = append(report.Conflicts, *conflict)
+			retainBoth(plan, existing, row, baseName, sourceDevice, chat, id)
+			if baseName == "target" {
+				plan.updates = append(plan.updates, rowUpdate{table: "messages", keys: []string{"id", "chat_jid", "device_id"}, row: rewritten})
+			}
 			continue
 		}
 		plan.fills = append(plan.fills, fills...)
@@ -629,7 +669,7 @@ func buildOverlayPlan(report *OverlayReport, srcDB, dstDB queryer, accounts []ve
 	if err != nil {
 		return nil, err
 	}
-	if err := planChildren(report, plan, srcDB, dstDB, targetOf, unmapped, byKey); err != nil {
+	if err := planChildren(report, plan, srcDB, dstDB, targetOf, unmapped, byKey, baseName); err != nil {
 		return nil, err
 	}
 	for id := range unmapped {
@@ -648,10 +688,10 @@ func buildOverlayPlan(report *OverlayReport, srcDB, dstDB queryer, accounts []ve
 		report.Reasons = append(report.Reasons, "incoming history has unmapped device ids that are not in the account map: "+strings.Join(report.UnmappedDeviceIDs, ", "))
 	}
 	if len(report.Ambiguous) > 0 {
-		report.Reasons = append(report.Reasons, "message ids appear under more than one chat JID; refusing to guess a LID or phone association")
+		report.Notes = append(report.Notes, "Message ids that appear under more than one chat are kept as separate rows. No LID or phone alias was inferred.")
 	}
 	if len(report.Conflicts) > 0 {
-		report.Reasons = append(report.Reasons, "payload conflicts were kept in the report and neither row was overwritten")
+		report.Notes = append(report.Notes, "Divergent payloads were not discarded. The source row is the staged primary and both original rows are in the private audit.")
 	}
 	for _, row := range plan.messages {
 		device, err := rowString(row, "device_id")
@@ -741,18 +781,18 @@ func planChats(report *OverlayReport, plan *planned, srcDB, dstDB queryer, targe
 	return have, nil
 }
 
-func planChildren(report *OverlayReport, plan *planned, srcDB, dstDB queryer, targetOf map[string]string, unmapped map[string]struct{}, messages map[string]sqlRow) error {
+func planChildren(report *OverlayReport, plan *planned, srcDB, dstDB queryer, targetOf map[string]string, unmapped map[string]struct{}, messages map[string]sqlRow, baseName string) error {
 	specs := []struct {
-		table   string
-		key     []string
-		idCol   string
-		parent  bool
-		assign  *[]sqlRow
-		counter *int
+		table       string
+		key         []string
+		idCol       string
+		assign      *[]sqlRow
+		counter     *int
+		allowOrphan bool
 	}{
-		{"message_reactions", []string{"message_id", "reactor_jid", "device_id"}, "message_id", true, &plan.reactions, &report.InsertedReactions},
-		{"message_edits", []string{"original_message_id", "edit_event_id", "device_id"}, "edit_event_id", true, &plan.edits, &report.InsertedEdits},
-		{"poll_definitions", []string{"device_id", "chat_jid", "poll_message_id"}, "poll_message_id", true, &plan.polls, &report.InsertedPolls},
+		{"message_reactions", []string{"message_id", "reactor_jid", "device_id"}, "message_id", &plan.reactions, &report.InsertedReactions, true},
+		{"message_edits", []string{"original_message_id", "edit_event_id", "device_id"}, "edit_event_id", &plan.edits, &report.InsertedEdits, false},
+		{"poll_definitions", []string{"device_id", "chat_jid", "poll_message_id"}, "poll_message_id", &plan.polls, &report.InsertedPolls, true},
 	}
 	for _, spec := range specs {
 		srcRows, err := readHistory(srcDB, spec.table)
@@ -776,6 +816,9 @@ func planChildren(report *OverlayReport, plan *planned, srcDB, dstDB queryer, ta
 				return fmt.Errorf("duplicate %s key", spec.table)
 			}
 			existing[key] = row
+			if _, err := recordOrphan(report, plan, spec.table, parentColumn(spec.table), row, messages, baseOriginName(baseName), true); err != nil {
+				return err
+			}
 		}
 		for _, row := range dstRows {
 			device, err := rowString(row, "device_id")
@@ -810,7 +853,15 @@ func planChildren(report *OverlayReport, plan *planned, srcDB, dstDB queryer, ta
 			}
 			parentKey := sourceDevice + "\x00" + chat + "\x00" + messageID
 			if _, ok := messages[parentKey]; !ok {
-				return fmt.Errorf("%s row %s has no message; refusing to drop or relink it", spec.table, messageID)
+				if _, err := recordOrphan(report, plan, spec.table, parentColumn(spec.table), row, nil, incomingOriginName(baseName), false); err != nil {
+					return err
+				}
+				if spec.allowOrphan {
+					*spec.assign = append(*spec.assign, rewritten)
+					report.Orphans[len(report.Orphans)-1].RetainedInStagedDB = true
+					plan.auditOrphans[len(plan.auditOrphans)-1].inStaged = true
+				}
+				continue
 			}
 			current, found := existing[key]
 			if !found {
@@ -831,6 +882,10 @@ func planChildren(report *OverlayReport, plan *planned, srcDB, dstDB queryer, ta
 					continue
 				}
 				report.Conflicts = append(report.Conflicts, RowConflict{Table: spec.table, DeviceID: sourceDevice, ChatJID: chat, ID: id, Class: "genuine_content"})
+				retainBoth(plan, current, row, baseName, sourceDevice, chat, id)
+				if baseName == "target" {
+					plan.updates = append(plan.updates, rowUpdate{table: spec.table, keys: spec.key, row: rewritten})
+				}
 			}
 		}
 		*spec.counter = len(*spec.assign)
@@ -895,7 +950,130 @@ func messageRef(row sqlRow) (MessageRef, error) {
 }
 
 func rejected(report *OverlayReport) bool {
-	return len(report.Reasons) > 0 || len(report.Conflicts) > 0 || len(report.Ambiguous) > 0 || len(report.UnmappedDeviceIDs) > 0
+	return len(report.Reasons) > 0 || len(report.UnmappedDeviceIDs) > 0
+}
+
+func baseOriginName(baseName string) string {
+	if baseName == "target" {
+		return "target"
+	}
+	return "source"
+}
+
+func incomingOriginName(baseName string) string {
+	if baseName == "target" {
+		return "source"
+	}
+	return "target"
+}
+
+func parentColumn(table string) string {
+	switch table {
+	case "message_edits":
+		return "original_message_id"
+	case "poll_definitions":
+		return "poll_message_id"
+	default:
+		return "message_id"
+	}
+}
+
+func recordOrphan(report *OverlayReport, plan *planned, table, idCol string, row sqlRow, messages map[string]sqlRow, origin string, inStaged bool) (bool, error) {
+	device, err := rowString(row, "device_id")
+	if err != nil {
+		return false, err
+	}
+	chat, err := rowString(row, "chat_jid")
+	if err != nil {
+		return false, err
+	}
+	messageID, err := rowString(row, idCol)
+	if err != nil {
+		return false, err
+	}
+	if messages != nil {
+		if _, ok := messages[device+"\x00"+chat+"\x00"+messageID]; ok {
+			return false, nil
+		}
+	}
+	report.Orphans = append(report.Orphans, OrphanRef{
+		Table: table, DeviceID: device, ChatJID: chat, MessageID: messageID,
+		Origin: origin, RetainedInStagedDB: inStaged, ParentInvented: false,
+	})
+	plan.auditOrphans = append(plan.auditOrphans, auditOrphan{
+		table: table, device: device, chat: chat, id: messageID, origin: origin, row: row, inStaged: inStaged,
+	})
+	return true, nil
+}
+
+func updateRow(tx *sql.Tx, update rowUpdate) error {
+	table, err := quoteIdent(update.table)
+	if err != nil {
+		return err
+	}
+	keys := map[string]struct{}{}
+	for _, key := range update.keys {
+		keys[key] = struct{}{}
+	}
+	var sets []string
+	var args []any
+	for i, col := range update.row.cols {
+		if _, ok := keys[col]; ok {
+			continue
+		}
+		quoted, err := quoteIdent(col)
+		if err != nil {
+			return err
+		}
+		sets = append(sets, quoted+"=?")
+		args = append(args, update.row.vals[i])
+	}
+	var where []string
+	for _, key := range update.keys {
+		quoted, err := quoteIdent(key)
+		if err != nil {
+			return err
+		}
+		value, ok := rowField(update.row, key)
+		if !ok {
+			return fmt.Errorf("update %s is missing %s", update.table, key)
+		}
+		where = append(where, quoted+"=?")
+		args = append(args, value)
+	}
+	if len(sets) == 0 {
+		return nil
+	}
+	res, err := tx.Exec(`UPDATE `+table+` SET `+strings.Join(sets, ", ")+` WHERE `+strings.Join(where, " AND "), args...)
+	if err != nil {
+		return fmt.Errorf("update %s: %w", update.table, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return fmt.Errorf("update %s matched %d rows", update.table, n)
+	}
+	return nil
+}
+
+func retainBoth(plan *planned, baseRow, incoming sqlRow, baseName, device, chat, id string) {
+	baseOrigin, incomingOrigin := "source", "target"
+	if baseName == "target" {
+		baseOrigin, incomingOrigin = "target", "source"
+	}
+	add := func(row sqlRow, origin string) {
+		role := "retained_alternate"
+		if origin == "source" {
+			role = "primary"
+		}
+		plan.auditMessages = append(plan.auditMessages, auditMessage{
+			device: device, chat: chat, id: id, origin: origin, role: role, row: row,
+		})
+	}
+	add(baseRow, baseOrigin)
+	add(incoming, incomingOrigin)
 }
 
 func publishOverlay(ctx context.Context, sourceSnap, out string, plan *planned) error {
@@ -935,6 +1113,12 @@ func publishOverlay(ctx context.Context, sourceSnap, out string, plan *planned) 
 				tx.Rollback()
 				return fmt.Errorf("insert %s: %w", batch.table, err)
 			}
+		}
+	}
+	for _, update := range plan.updates {
+		if err := updateRow(tx, update); err != nil {
+			tx.Rollback()
+			return err
 		}
 	}
 	for _, fill := range plan.fills {

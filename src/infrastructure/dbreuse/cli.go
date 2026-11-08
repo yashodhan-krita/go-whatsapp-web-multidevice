@@ -23,6 +23,7 @@ It has no rest command. history_complete is false in every report.
   media-refs --db FILE [--archive FILE ...] [--out REPORT]
   overlay --source DB --target DB --map FILE --work-dir DIR --out FILE [--base source|target] [--allow-live-validation]
   coverage --db FILE --archive FILE [--archive FILE ...] [--out REPORT]
+  import-archive --db FILE --archive FILE [--archive FILE ...] [--account JID] [--audit FILE]
   gate --db FILE --expect-revision SHA --attest-writers LIST [--target DB --work-dir DIR]
 
 --attest-writers must be exactly:
@@ -60,6 +61,8 @@ func runOffline(stdout, stderr io.Writer, args []string) int {
 		return cmdOverlay(stdout, stderr, args[1:])
 	case "coverage":
 		return cmdCoverage(stdout, stderr, args[1:])
+	case "import-archive":
+		return cmdImport(stdout, stderr, args[1:])
 	case "gate":
 		return cmdGate(stdout, stderr, args[1:])
 	default:
@@ -206,6 +209,21 @@ func cmdCoverage(stdout, stderr io.Writer, args []string) int {
 		}
 	}
 	blocked := report == nil || report.HistoryComplete
+	return finish(stdout, stderr, report, err, blocked || err != nil)
+}
+
+func cmdImport(stdout, stderr io.Writer, args []string) int {
+	fs := newFlagSet(stderr, "import-archive")
+	path := fs.String("db", "", "staged chatstorage snapshot to update")
+	account := fs.String("account", "", "registry storage JID; required when the filename has none")
+	audit := fs.String("audit", "", "private audit database; default is the snapshot path plus .migration-audit.db")
+	var archives stringList
+	fs.Var(&archives, "archive", "history-sync JSON file; repeat for each archive")
+	if !parseSet(fs, args, stderr) {
+		return 2
+	}
+	report, err := ImportArchives(ImportRequest{DB: *path, Account: *account, Audit: *audit, Archives: archives})
+	blocked := report == nil || report.HistoryComplete || report.OldBridgeAssessed || report.MetadataOnlyIsProof
 	return finish(stdout, stderr, report, err, blocked || err != nil)
 }
 

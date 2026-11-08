@@ -334,16 +334,13 @@ func TestOverlayRejectsIdentityConflictsAndKeepsOriginals(t *testing.T) {
 		Label: "synthetic-a", Phone: "15550001000",
 		SourceStorageJID: "15550001000@s.whatsapp.net", TargetStorageJID: "15550001000@s.whatsapp.net",
 	})
-	out := filepath.Join(t.TempDir(), "nope.db")
+	out := filepath.Join(t.TempDir(), "kept.db")
 	report, err := Overlay(context.Background(), OverlayRequest{Source: srcPath, Target: dstPath, MapPath: mapping, WorkDir: t.TempDir(), Out: out})
-	if !errors.Is(err, ErrRejected) {
-		t.Fatalf("err %v", err)
+	if err != nil || !report.Applied || report.HistoryComplete || report.CutoverReady || report.AliasInferred {
+		t.Fatalf("conflict publish %+v %v", report, err)
 	}
-	if report.Applied || len(report.Conflicts) != 1 || report.Conflicts[0].ID != "synthetic-m1" || report.Conflicts[0].Class != "genuine_content" {
+	if len(report.Conflicts) != 1 || report.Conflicts[0].ID != "synthetic-m1" || report.Conflicts[0].Class != "genuine_content" || report.DivergentRetained != 1 {
 		t.Fatalf("conflict %+v", report)
-	}
-	if _, statErr := os.Stat(out); !os.IsNotExist(statErr) {
-		t.Fatal("conflict published an overlay")
 	}
 	if fileSum(t, srcPath) != before {
 		t.Fatal("conflict modified the source")
@@ -351,6 +348,26 @@ func TestOverlayRejectsIdentityConflictsAndKeepsOriginals(t *testing.T) {
 	encoded, _ := json.Marshal(report)
 	if strings.Contains(string(encoded), "changed on target") || strings.Contains(string(encoded), "synthetic hello") {
 		t.Fatal("conflict report included message text")
+	}
+	kept, err := sql.Open(sqlite.DriverName, out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stagedContent string
+	if err := kept.QueryRow(`SELECT content FROM messages WHERE id='synthetic-m1'`).Scan(&stagedContent); err != nil {
+		t.Fatal(err)
+	}
+	kept.Close()
+	if stagedContent != "synthetic hello" {
+		t.Fatalf("primary content %q", stagedContent)
+	}
+	hasAlternate, err := rowsInAudit(report.AuditPath, "changed on target")
+	if err != nil || !hasAlternate {
+		t.Fatalf("audit alternate %v", err)
+	}
+	hasPrimary, err := rowsInAudit(report.AuditPath, "synthetic hello")
+	if err != nil || !hasPrimary {
+		t.Fatalf("audit primary %v", err)
 	}
 
 	slotMap := writeMap(t, AccountMapping{Label: "synthetic-a", Phone: "15550001000", SourceStorageJID: "synthetic-slot", TargetStorageJID: "15550001000@s.whatsapp.net"})
@@ -379,9 +396,22 @@ func TestOverlayRejectsIdentityConflictsAndKeepsOriginals(t *testing.T) {
 		t.Fatal(err)
 	}
 	ambDB.Close()
-	amb, err := Overlay(context.Background(), OverlayRequest{Source: srcPath, Target: ambPath, MapPath: mapping, WorkDir: filepath.Join(t.TempDir(), "amb"), Out: filepath.Join(t.TempDir(), "amb.db")})
-	if !errors.Is(err, ErrRejected) || len(amb.Ambiguous) != 1 || amb.Applied {
+	ambOut := filepath.Join(t.TempDir(), "amb.db")
+	amb, err := Overlay(context.Background(), OverlayRequest{Source: srcPath, Target: ambPath, MapPath: mapping, WorkDir: filepath.Join(t.TempDir(), "amb"), Out: ambOut})
+	if err != nil || !amb.Applied || len(amb.Ambiguous) != 1 || amb.AliasInferred || amb.HistoryComplete {
 		t.Fatalf("ambiguous %+v %v", amb, err)
+	}
+	ambDBCheck, err := sql.Open(sqlite.DriverName, ambOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var distinct int
+	if err := ambDBCheck.QueryRow(`SELECT COUNT(*) FROM messages WHERE id='synthetic-m1'`).Scan(&distinct); err != nil {
+		t.Fatal(err)
+	}
+	ambDBCheck.Close()
+	if distinct != 2 {
+		t.Fatalf("distinct chats %d", distinct)
 	}
 
 	otherDB, otherPath := newSchemaDB(t)
@@ -719,11 +749,20 @@ func TestOverlayClassifiesMetadataWithoutPublishingContentConflicts(t *testing.T
 	blockedReport, err := Overlay(context.Background(), OverlayRequest{
 		Source: srcPath, Target: dst2Path, MapPath: mapping, WorkDir: filepath.Join(t.TempDir(), "block"), Out: blocked,
 	})
-	if !errors.Is(err, ErrRejected) || blockedReport.Applied || blockedReport.Conflicts[0].Class != "genuine_content" {
+	if err != nil || !blockedReport.Applied || blockedReport.Conflicts[0].Class != "genuine_content" || blockedReport.HistoryComplete {
 		t.Fatalf("sender flag %+v %v", blockedReport, err)
 	}
-	if _, statErr := os.Stat(blocked); !os.IsNotExist(statErr) {
-		t.Fatal("genuine conflict published")
+	flagDB, err := sql.Open(sqlite.DriverName, blocked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fromMe any
+	if err := flagDB.QueryRow(`SELECT is_from_me FROM messages WHERE id='synthetic-m1'`).Scan(&fromMe); err != nil {
+		t.Fatal(err)
+	}
+	flagDB.Close()
+	if fmt.Sprint(fromMe) == "1" || fmt.Sprint(fromMe) == "true" {
+		t.Fatalf("source is_from_me %v", fromMe)
 	}
 
 	dst3, dst3Path := newSchemaDB(t)
@@ -748,15 +787,28 @@ func TestOverlayClassifiesMetadataWithoutPublishingContentConflicts(t *testing.T
 	editReport, err := Overlay(context.Background(), OverlayRequest{
 		Source: srcPath, Target: dst3Path, MapPath: mapping, WorkDir: filepath.Join(t.TempDir(), "edit"), Out: editOut,
 	})
-	if !errors.Is(err, ErrRejected) || editReport.Applied || len(editReport.Conflicts) != 1 || editReport.Conflicts[0].Class != "edit_divergence" {
+	if err != nil || !editReport.Applied || len(editReport.Conflicts) != 1 || editReport.Conflicts[0].Class != "edit_divergence" {
 		t.Fatalf("edit %+v %v", editReport, err)
 	}
 	editJSON, _ := json.Marshal(editReport)
 	if strings.Contains(string(editJSON), "synthetic edited") || strings.Contains(string(editJSON), "synthetic hello") {
 		t.Fatal("edit report included message text")
 	}
-	if _, statErr := os.Stat(editOut); !os.IsNotExist(statErr) {
-		t.Fatal("edit divergence published")
+	keptEdit, err := rowsInAudit(editReport.AuditPath, "synthetic edited")
+	if err != nil || !keptEdit {
+		t.Fatalf("edit audit %v", err)
+	}
+	editDB, err := sql.Open(sqlite.DriverName, editOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var editContent string
+	if err := editDB.QueryRow(`SELECT content FROM messages WHERE id='synthetic-m1'`).Scan(&editContent); err != nil {
+		t.Fatal(err)
+	}
+	editDB.Close()
+	if editContent != "synthetic hello" {
+		t.Fatalf("edit primary %q", editContent)
 	}
 }
 
@@ -855,6 +907,132 @@ func TestMediaReferencesFailClosed(t *testing.T) {
 	var out, errBuf bytes.Buffer
 	if code := runOffline(&out, &errBuf, []string{"media-refs", "--db", path}); code != 0 || !strings.Contains(out.String(), `"subset_proven": false`) || strings.Contains(out.String(), `"history_complete": true`) {
 		t.Fatalf("cli %d %s %s", code, out.String(), errBuf.String())
+	}
+}
+
+func TestOverlayKeepsOrphanReactionAndSourcePrimaryOnTargetBase(t *testing.T) {
+	src, srcPath := newSchemaDB(t)
+	insertSyntheticHistory(t, src)
+	freezeClocks(t, src)
+	src.Close()
+	dst, dstPath := newSchemaDB(t)
+	insertSyntheticHistory(t, dst)
+	freezeClocks(t, dst)
+	if _, err := dst.Exec(`UPDATE messages SET content='box wording' WHERE id='synthetic-m1'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dst.Exec(`INSERT INTO message_reactions (message_id, chat_jid, device_id, reactor_jid, emoji, reaction_timestamp) VALUES ('synthetic-missing', '15550002000@s.whatsapp.net', '15550001000@s.whatsapp.net', '15550002000@s.whatsapp.net', 'synthetic-emoji', '2026-03-03 00:01:00')`); err != nil {
+		t.Fatal(err)
+	}
+	dst.Close()
+	mapping := writeMap(t, AccountMapping{
+		Label: "synthetic-a", Phone: "15550001000",
+		SourceStorageJID: "15550001000@s.whatsapp.net", TargetStorageJID: "15550001000@s.whatsapp.net",
+	})
+	out := filepath.Join(t.TempDir(), "union.db")
+	report, err := Overlay(context.Background(), OverlayRequest{
+		Source: srcPath, Target: dstPath, MapPath: mapping, WorkDir: t.TempDir(), Out: out, Base: "target",
+	})
+	if err != nil || !report.Applied || report.AliasInferred || report.HistoryComplete {
+		t.Fatalf("union %+v %v", report, err)
+	}
+	encoded, _ := json.Marshal(report)
+	if strings.Contains(string(encoded), "box wording") || strings.Contains(string(encoded), "synthetic-emoji") || strings.Contains(string(encoded), "synthetic hello") {
+		t.Fatal("public report included a payload")
+	}
+	var orphan OrphanRef
+	for _, item := range report.Orphans {
+		if item.MessageID == "synthetic-missing" {
+			orphan = item
+		}
+	}
+	if orphan.Table != "message_reactions" || orphan.ParentInvented || !orphan.RetainedInStagedDB {
+		t.Fatalf("orphan %+v", report.Orphans)
+	}
+	staged, err := sql.Open(sqlite.DriverName, out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var content string
+	var reactions int
+	var invented int
+	if err := staged.QueryRow(`SELECT content FROM messages WHERE id='synthetic-m1'`).Scan(&content); err != nil {
+		t.Fatal(err)
+	}
+	if err := staged.QueryRow(`SELECT COUNT(*) FROM message_reactions WHERE message_id='synthetic-missing'`).Scan(&reactions); err != nil {
+		t.Fatal(err)
+	}
+	if err := staged.QueryRow(`SELECT COUNT(*) FROM messages WHERE id='synthetic-missing'`).Scan(&invented); err != nil {
+		t.Fatal(err)
+	}
+	staged.Close()
+	if content != "synthetic hello" || reactions != 1 || invented != 0 {
+		t.Fatalf("content %q reactions %d invented %d", content, reactions, invented)
+	}
+	kept, err := rowsInAudit(report.AuditPath, "box wording")
+	if err != nil || !kept {
+		t.Fatalf("audit %v", err)
+	}
+}
+
+func TestImportArchiveInsertsAbsentMessagesOnly(t *testing.T) {
+	db, path := newSchemaDB(t)
+	insertSyntheticHistory(t, db)
+	db.Close()
+	write := func(name, body string) string {
+		t.Helper()
+		file := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(file, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return file
+	}
+	present := write("history-1-15550001000@s.whatsapp.net-1-RECENT.json", `{"syncType":2,"conversations":[{"ID":"15550002000@s.whatsapp.net","messages":[{"message":{"key":{"remoteJid":"15550002000@s.whatsapp.net","fromMe":false,"id":"synthetic-m1"},"message":{"conversation":"synthetic archive body"},"messageTimestamp":1700000000}},{"message":{"key":{"remoteJid":"15550002000@s.whatsapp.net","fromMe":false,"id":"synthetic-absent"},"message":{"conversation":"absent body"},"messageTimestamp":1700000002}}]},{"ID":"15550009999@s.whatsapp.net","messages":[{"message":{"key":{"remoteJid":"15550009999@s.whatsapp.net","fromMe":false,"id":"synthetic-m1"},"message":{"conversation":"other chat body"},"messageTimestamp":1700000001}}]},{"ID":"120363000@g.us","messages":[{"message":{"key":{"remoteJid":"120363000@g.us","id":"synthetic-group"},"message":{"conversation":"group body"},"messageTimestamp":1700000003}}]}]}`)
+	meta := write("history-1-15550001000@s.whatsapp.net-2-PUSH_NAME.json", `{"syncType":4,"chunkOrder":1,"pushnames":[{"id":"synthetic"}]}`)
+	before := fileSum(t, path)
+	wrong := write("history-1-15550009999@s.whatsapp.net-1-RECENT.json", `{"syncType":2,"conversations":[{"ID":"15550002000@s.whatsapp.net","messages":[{"message":{"key":{"remoteJid":"15550002000@s.whatsapp.net","id":"synthetic-nope"},"message":{"conversation":"nope"},"messageTimestamp":1700000004}}]}]}`)
+	if _, err := ImportArchives(ImportRequest{DB: path, Archives: []string{wrong}}); err == nil {
+		t.Fatal("unscoped archive was imported")
+	}
+	if fileSum(t, path) != before {
+		t.Fatal("refused import modified the database")
+	}
+	report, err := ImportArchives(ImportRequest{DB: path, Archives: []string{present, meta}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.HistoryComplete || report.OldBridgeAssessed || report.MetadataOnlyIsProof || report.Account != "15550001000@s.whatsapp.net" {
+		t.Fatalf("import %+v", report)
+	}
+	if report.Imported != 2 || report.AlreadyPresent != 1 || report.DistinctOtherChat != 1 || report.SkippedMetadataOnly != 1 || report.SenderUnresolved != 1 || report.TextExtracted != 2 {
+		t.Fatalf("counts %+v", report)
+	}
+	encoded, _ := json.Marshal(report)
+	if strings.Contains(string(encoded), "absent body") || strings.Contains(string(encoded), "other chat body") || strings.Contains(string(encoded), "group body") {
+		t.Fatal("import report included message text")
+	}
+	staged, err := sql.Open(sqlite.DriverName, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var absent, original, other string
+	var group int
+	if err := staged.QueryRow(`SELECT content FROM messages WHERE id='synthetic-absent'`).Scan(&absent); err != nil || absent != "absent body" {
+		t.Fatalf("absent %q %v", absent, err)
+	}
+	if err := staged.QueryRow(`SELECT content FROM messages WHERE id='synthetic-m1' AND chat_jid='15550002000@s.whatsapp.net'`).Scan(&original); err != nil || original != "synthetic hello" {
+		t.Fatalf("original %q %v", original, err)
+	}
+	if err := staged.QueryRow(`SELECT content FROM messages WHERE id='synthetic-m1' AND chat_jid='15550009999@s.whatsapp.net'`).Scan(&other); err != nil || other != "other chat body" {
+		t.Fatalf("other %q %v", other, err)
+	}
+	if err := staged.QueryRow(`SELECT COUNT(*) FROM messages WHERE id='synthetic-group'`).Scan(&group); err != nil || group != 0 {
+		t.Fatalf("group %d %v", group, err)
+	}
+	staged.Close()
+	kept, err := rowsInAudit(report.AuditPath, "group body")
+	if err != nil || !kept {
+		t.Fatalf("group audit %v", err)
 	}
 }
 
