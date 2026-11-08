@@ -337,6 +337,45 @@ tables are counted only. Their URLs, secrets, and payloads are not read.
 opened read-only.
 
 ```sh
+./db-reuse-linux-amd64 legacy-verify \
+  --db /absolute/path/to/work/staged.db \
+  --map /absolute/path/to/work/legacy-accounts.json \
+  --audit /absolute/path/to/work/staged.db.migration-audit.db
+```
+
+`legacy-verify` is read-only. It hashes each legacy file again and refuses a
+map whose `source_sha256` does not match. For every message, poll option,
+poll vote, and contact nickname it requires the private `legacy_rows.row_json`
+to be that exact source payload. A row with the same account, chat, and id
+but different JSON is `tampered` and `verified` stays false. A staged message
+id is not enough. `staged_payload_match` counts GOWA columns that still match
+the legacy projection. `audit_only` counts exact audit payloads whose staged
+projection differs or was not inserted, including a kept GOWA conflict and a
+message with no supported sender. An empty extra column can be covered by the
+staged row alone. A non-empty quoted field, sender name, or poll field cannot.
+
+`legacy_rows` is the audit table:
+
+```sql
+CREATE TABLE legacy_rows (
+  source_sha256 TEXT NOT NULL,
+  account_jid TEXT NOT NULL,
+  table_name TEXT NOT NULL,
+  chat_jid TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  imported INTEGER NOT NULL,
+  row_json TEXT NOT NULL
+);
+```
+
+The map is the same declaration `legacy-import` uses. Webhook tables are
+counted and their values are not read. `verified` does not set
+`history_complete`, `cutover_ready`, or `old_bridge_assessed`. The command
+does not insert the 17 archive group messages that have no participant, and
+it does not invent a sender for them.
+
+```sh
 ./db-reuse-linux-amd64 legacy-schema \
   --db /absolute/path/to/work/messages.db
 ```

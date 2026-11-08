@@ -377,6 +377,34 @@ func init() {
 	legacyImportCmd.Flags().String("audit", "", "private audit database")
 	dbReuseCmd.AddCommand(legacyImportCmd)
 
+	legacyVerifyCmd := &cobra.Command{
+		Use:   "legacy-verify",
+		Short: "Re-read declared legacy files and require exact audit payloads",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			path, _ := cmd.Flags().GetString("db")
+			mapping, _ := cmd.Flags().GetString("map")
+			audit, _ := cmd.Flags().GetString("audit")
+			report, err := dbreuse.LegacyVerify(cmd.Context(), dbreuse.LegacyVerifyRequest{Staged: path, MapPath: mapping, Audit: audit})
+			if report != nil {
+				if writeErr := writeJSON(cmd.OutOrStdout(), report); writeErr != nil {
+					return writeErr
+				}
+			}
+			if err != nil {
+				return err
+			}
+			if report == nil || !report.Verified || report.HistoryComplete || report.CutoverReady || report.OldBridgeAssessed {
+				return fmt.Errorf("legacy verify failed")
+			}
+			return nil
+		},
+	}
+	legacyVerifyCmd.Flags().String("db", "", "staged GOWA chatstorage database")
+	legacyVerifyCmd.Flags().String("map", "", "legacy file to storage JID map")
+	legacyVerifyCmd.Flags().String("audit", "", "private audit database")
+	dbReuseCmd.AddCommand(legacyVerifyCmd)
+
 	legacySchemaCmd := &cobra.Command{
 		Use:   "legacy-schema",
 		Short: "Report a SQLite history database's tables without reading rows",
