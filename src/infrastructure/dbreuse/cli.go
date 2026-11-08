@@ -20,7 +20,8 @@ It has no rest command. history_complete is false in every report.
   preflight --db FILE
   reconcile --source DB --target DB --work-dir DIR [--out REPORT]
   materialize-media --source DIR --dest DIR [--out REPORT]
-  overlay --source DB --target DB --map FILE --work-dir DIR --out FILE [--allow-live-validation]
+  media-refs --db FILE [--archive FILE ...] [--out REPORT]
+  overlay --source DB --target DB --map FILE --work-dir DIR --out FILE [--base source|target] [--allow-live-validation]
   coverage --db FILE --archive FILE [--archive FILE ...] [--out REPORT]
   gate --db FILE --expect-revision SHA --attest-writers LIST [--target DB --work-dir DIR]
 
@@ -53,6 +54,8 @@ func runOffline(stdout, stderr io.Writer, args []string) int {
 		return cmdReconcile(stdout, stderr, args[1:])
 	case "materialize-media":
 		return cmdMedia(stdout, stderr, args[1:])
+	case "media-refs":
+		return cmdMediaRefs(stdout, stderr, args[1:])
 	case "overlay":
 		return cmdOverlay(stdout, stderr, args[1:])
 	case "coverage":
@@ -144,6 +147,26 @@ func cmdMedia(stdout, stderr io.Writer, args []string) int {
 	return finish(stdout, stderr, manifest, err, false)
 }
 
+func cmdMediaRefs(stdout, stderr io.Writer, args []string) int {
+	fs := newFlagSet(stderr, "media-refs")
+	path := fs.String("db", "", "chatstorage snapshot")
+	out := fs.String("out", "", "optional JSON report path")
+	root := fs.String("media-root", "", "refused; display names are not matched to a tree")
+	var archives stringList
+	fs.Var(&archives, "archive", "history-sync JSON file; repeat for each archive")
+	if !parseSet(fs, args, stderr) {
+		return 2
+	}
+	report, err := MediaReferences(MediaRefRequest{DB: *path, Archives: archives, MediaRoot: *root})
+	if report != nil && *out != "" && err == nil {
+		if writeErr := writeReportFile(*out, report); writeErr != nil {
+			err = writeErr
+		}
+	}
+	blocked := report == nil || report.SubsetProven || report.WholeTreeCopyAllowed || report.PurgeAllowed || report.HistoryComplete
+	return finish(stdout, stderr, report, err, blocked || err != nil)
+}
+
 func cmdOverlay(stdout, stderr io.Writer, args []string) int {
 	fs := newFlagSet(stderr, "overlay")
 	source := fs.String("source", "", "source chatstorage.db")
@@ -151,12 +174,13 @@ func cmdOverlay(stdout, stderr io.Writer, args []string) int {
 	mapping := fs.String("map", "", "account mapping JSON")
 	work := fs.String("work-dir", "", "directory for read-only snapshots")
 	out := fs.String("out", "", "new staged database")
+	base := fs.String("base", "source", "source keeps the source registry; target keeps the target registry")
 	live := fs.Bool("allow-live-validation", false, "allow -shm on the inputs; the output is not a cutover file")
 	if !parseSet(fs, args, stderr) {
 		return 2
 	}
 	report, err := Overlay(context.Background(), OverlayRequest{
-		Source: *source, Target: *target, MapPath: *mapping, WorkDir: *work, Out: *out, AllowLiveValidation: *live,
+		Source: *source, Target: *target, MapPath: *mapping, WorkDir: *work, Out: *out, AllowLiveValidation: *live, Base: *base,
 	})
 	blocked := err != nil || report == nil || !report.Applied || report.HistoryComplete || report.CutoverReady
 	return finish(stdout, stderr, report, err, blocked)

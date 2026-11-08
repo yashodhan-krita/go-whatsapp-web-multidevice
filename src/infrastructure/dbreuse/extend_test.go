@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -338,7 +339,7 @@ func TestOverlayRejectsIdentityConflictsAndKeepsOriginals(t *testing.T) {
 	if !errors.Is(err, ErrRejected) {
 		t.Fatalf("err %v", err)
 	}
-	if report.Applied || len(report.Conflicts) != 1 || report.Conflicts[0].ID != "synthetic-m1" {
+	if report.Applied || len(report.Conflicts) != 1 || report.Conflicts[0].ID != "synthetic-m1" || report.Conflicts[0].Class != "genuine_content" {
 		t.Fatalf("conflict %+v", report)
 	}
 	if _, statErr := os.Stat(out); !os.IsNotExist(statErr) {
@@ -562,6 +563,298 @@ func TestOfflineCLIDoesNotClaimCompleteHistory(t *testing.T) {
 	out.Reset()
 	if code := runOffline(&out, &errBuf, []string{"revision"}); code != 0 || !strings.Contains(out.String(), installedRevisionSHA) || strings.Contains(out.String(), `"history_complete": true`) {
 		t.Fatalf("revision %d %s", code, out.String())
+	}
+}
+
+func freezeClocks(t *testing.T, db *sql.DB) {
+	t.Helper()
+	for _, query := range []string{
+		`UPDATE messages SET created_at='2026-01-02 03:04:05', updated_at='2026-01-02 03:04:05'`,
+		`UPDATE message_reactions SET created_at='2026-01-02 03:04:05', updated_at='2026-01-02 03:04:05'`,
+		`UPDATE message_edits SET created_at='2026-01-02 03:04:05'`,
+		`UPDATE poll_definitions SET created_at='2026-01-02 03:04:05', updated_at='2026-01-02 03:04:05'`,
+	} {
+		if _, err := db.Exec(query); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestOverlayTargetBaseKeepsUnmappedAccount(t *testing.T) {
+	src, srcPath := newSchemaDB(t)
+	insertSyntheticHistory(t, src)
+	freezeClocks(t, src)
+	if _, err := src.Exec(`INSERT INTO messages (id, chat_jid, device_id, sender, content, timestamp, is_from_me, created_at, updated_at) VALUES ('synthetic-mac-only', '15550002000@s.whatsapp.net', '15550001000@s.whatsapp.net', '15550002000@s.whatsapp.net', 'from mac', '2022-06-01 00:00:00', 0, '2026-01-02 03:04:05', '2026-01-02 03:04:05')`); err != nil {
+		t.Fatal(err)
+	}
+	src.Close()
+	dst, dstPath := newSchemaDB(t)
+	insertSyntheticHistory(t, dst)
+	freezeClocks(t, dst)
+	if _, err := dst.Exec(`INSERT INTO devices (device_id, display_name, jid, ad_jid) VALUES ('synthetic-slot-b', 'synthetic b', '15550004000@s.whatsapp.net', '15550004000:1@s.whatsapp.net')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dst.Exec(`INSERT INTO chats (jid, device_id, name, last_message_time) VALUES ('15550002000@s.whatsapp.net', '15550004000@s.whatsapp.net', 'kept account', '2026-04-04 00:00:00')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dst.Exec(`INSERT INTO messages (id, chat_jid, device_id, sender, content, timestamp, is_from_me, created_at, updated_at) VALUES ('synthetic-box-only', '15550002000@s.whatsapp.net', '15550004000@s.whatsapp.net', '15550002000@s.whatsapp.net', 'kept on box', '2026-04-04 00:00:00', 0, '2026-01-02 03:04:05', '2026-01-02 03:04:05')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dst.Exec(`INSERT INTO messages (id, chat_jid, device_id, sender, content, timestamp, is_from_me, created_at, updated_at) VALUES ('synthetic-box-newer', '15550002000@s.whatsapp.net', '15550001000@s.whatsapp.net', '15550002000@s.whatsapp.net', 'newer on box', '2026-05-05 00:00:00', 0, '2026-01-02 03:04:05', '2026-01-02 03:04:05')`); err != nil {
+		t.Fatal(err)
+	}
+	dst.Close()
+	srcSum, dstSum := fileSum(t, srcPath), fileSum(t, dstPath)
+	mapping := writeMap(t, AccountMapping{
+		Label: "synthetic-a", Phone: "15550001000",
+		SourceStorageJID: "15550001000@s.whatsapp.net", TargetStorageJID: "15550001000@s.whatsapp.net",
+	})
+	out := filepath.Join(t.TempDir(), "box-base.db")
+	report, err := Overlay(context.Background(), OverlayRequest{
+		Source: srcPath, Target: dstPath, MapPath: mapping, WorkDir: t.TempDir(), Out: out, Base: "target",
+	})
+	if err != nil {
+		t.Fatalf("box base: %v %+v", err, report)
+	}
+	if !report.Applied || report.Base != "target" || report.HistoryComplete || report.CutoverReady {
+		t.Fatalf("report %+v", report)
+	}
+	if len(report.PreservedBaseDeviceIDs) != 1 || report.PreservedBaseDeviceIDs[0] != "15550004000@s.whatsapp.net" {
+		t.Fatalf("preserved %+v", report.PreservedBaseDeviceIDs)
+	}
+	if len(report.InsertedMessages) != 1 || report.InsertedMessages[0].ID != "synthetic-mac-only" || report.InsertedMessages[0].DeviceID != "15550001000@s.whatsapp.net" {
+		t.Fatalf("inserted %+v", report.InsertedMessages)
+	}
+	encoded, _ := json.Marshal(report)
+	for _, secret := range []string{"from mac", "kept on box", "newer on box", "synthetic-webhook-secret"} {
+		if strings.Contains(string(encoded), secret) {
+			t.Fatalf("report contains %s", secret)
+		}
+	}
+	if fileSum(t, srcPath) != srcSum || fileSum(t, dstPath) != dstSum {
+		t.Fatal("box base modified an original")
+	}
+	staged, err := sql.Open(sqlite.DriverName, out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer staged.Close()
+	var devices int
+	if err := staged.QueryRow(`SELECT COUNT(*) FROM devices`).Scan(&devices); err != nil {
+		t.Fatal(err)
+	}
+	if devices != 2 {
+		t.Fatalf("devices %d", devices)
+	}
+	var kept, newer string
+	if err := staged.QueryRow(`SELECT content FROM messages WHERE id='synthetic-box-only'`).Scan(&kept); err != nil || kept != "kept on box" {
+		t.Fatalf("kept %q %v", kept, err)
+	}
+	if err := staged.QueryRow(`SELECT content FROM messages WHERE id='synthetic-box-newer'`).Scan(&newer); err != nil || newer != "newer on box" {
+		t.Fatalf("newer %q %v", newer, err)
+	}
+}
+
+func TestOverlayClassifiesMetadataWithoutPublishingContentConflicts(t *testing.T) {
+	src, srcPath := newSchemaDB(t)
+	insertSyntheticHistory(t, src)
+	freezeClocks(t, src)
+	src.Close()
+	dst, dstPath := newSchemaDB(t)
+	insertSyntheticHistory(t, dst)
+	freezeClocks(t, dst)
+	if _, err := dst.Exec(`UPDATE messages SET timestamp='2026-06-01 00:00:00', filename='synthetic-display-name' WHERE id='synthetic-m1'`); err != nil {
+		t.Fatal(err)
+	}
+	dst.Close()
+	mapping := writeMap(t, AccountMapping{
+		Label: "synthetic-a", Phone: "15550001000",
+		SourceStorageJID: "15550001000@s.whatsapp.net", TargetStorageJID: "15550001000@s.whatsapp.net",
+	})
+	out := filepath.Join(t.TempDir(), "enriched.db")
+	report, err := Overlay(context.Background(), OverlayRequest{
+		Source: srcPath, Target: dstPath, MapPath: mapping, WorkDir: t.TempDir(), Out: out,
+	})
+	if err != nil || !report.Applied || len(report.Conflicts) != 0 || report.EnrichmentFills != 1 {
+		t.Fatalf("enrichment %+v %v", report, err)
+	}
+	encoded, _ := json.Marshal(report)
+	if strings.Contains(string(encoded), "synthetic-display-name") || strings.Contains(string(encoded), "synthetic hello") {
+		t.Fatal("enrichment report included a filename or body")
+	}
+	var sawTimestamp, sawFill bool
+	for _, diff := range report.ColumnDiffs {
+		if diff.Column == "timestamp" && diff.Class == "timestamp" && diff.Resolution == "kept_base" && diff.BaseTimestamp != "" && diff.IncomingTimestamp != "" {
+			sawTimestamp = true
+		}
+		if diff.Column == "filename" && diff.Class == "enrichment" && diff.Resolution == "filled_from_incoming" {
+			sawFill = true
+		}
+	}
+	if !sawTimestamp || !sawFill {
+		t.Fatalf("diffs %+v", report.ColumnDiffs)
+	}
+	staged, err := sql.Open(sqlite.DriverName, out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer staged.Close()
+	var stamp any
+	var name string
+	if err := staged.QueryRow(`SELECT timestamp, filename FROM messages WHERE id='synthetic-m1'`).Scan(&stamp, &name); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(fmt.Sprint(stamp), "2026-01-02") || name != "synthetic-display-name" {
+		t.Fatalf("staged timestamp %q filename %q", stamp, name)
+	}
+
+	dst2, dst2Path := newSchemaDB(t)
+	insertSyntheticHistory(t, dst2)
+	freezeClocks(t, dst2)
+	if _, err := dst2.Exec(`UPDATE messages SET is_from_me=1 WHERE id='synthetic-m1'`); err != nil {
+		t.Fatal(err)
+	}
+	dst2.Close()
+	blocked := filepath.Join(t.TempDir(), "blocked.db")
+	blockedReport, err := Overlay(context.Background(), OverlayRequest{
+		Source: srcPath, Target: dst2Path, MapPath: mapping, WorkDir: filepath.Join(t.TempDir(), "block"), Out: blocked,
+	})
+	if !errors.Is(err, ErrRejected) || blockedReport.Applied || blockedReport.Conflicts[0].Class != "genuine_content" {
+		t.Fatalf("sender flag %+v %v", blockedReport, err)
+	}
+	if _, statErr := os.Stat(blocked); !os.IsNotExist(statErr) {
+		t.Fatal("genuine conflict published")
+	}
+
+	dst3, dst3Path := newSchemaDB(t)
+	insertSyntheticHistory(t, dst3)
+	freezeClocks(t, dst3)
+	if _, err := dst3.Exec(`UPDATE messages SET content='synthetic edited' WHERE id='synthetic-m1'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dst3.Exec(`UPDATE message_edits SET previous_content='synthetic hello', new_content='synthetic edited' WHERE original_message_id='synthetic-m1'`); err != nil {
+		t.Fatal(err)
+	}
+	dst3.Close()
+	srcDB, err := sql.Open(sqlite.DriverName, srcPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srcDB.Exec(`UPDATE message_edits SET previous_content='synthetic hello', new_content='synthetic edited' WHERE original_message_id='synthetic-m1'`); err != nil {
+		t.Fatal(err)
+	}
+	srcDB.Close()
+	editOut := filepath.Join(t.TempDir(), "edit.db")
+	editReport, err := Overlay(context.Background(), OverlayRequest{
+		Source: srcPath, Target: dst3Path, MapPath: mapping, WorkDir: filepath.Join(t.TempDir(), "edit"), Out: editOut,
+	})
+	if !errors.Is(err, ErrRejected) || editReport.Applied || len(editReport.Conflicts) != 1 || editReport.Conflicts[0].Class != "edit_divergence" {
+		t.Fatalf("edit %+v %v", editReport, err)
+	}
+	editJSON, _ := json.Marshal(editReport)
+	if strings.Contains(string(editJSON), "synthetic edited") || strings.Contains(string(editJSON), "synthetic hello") {
+		t.Fatal("edit report included message text")
+	}
+	if _, statErr := os.Stat(editOut); !os.IsNotExist(statErr) {
+		t.Fatal("edit divergence published")
+	}
+}
+
+func TestCoverageAcceptsEmptyAndMetadataArchives(t *testing.T) {
+	db, path := newSchemaDB(t)
+	insertSyntheticHistory(t, db)
+	db.Close()
+	write := func(name, body string) string {
+		t.Helper()
+		file := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(file, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return file
+	}
+	empty := write("empty.json", `{"syncType":3,"conversations":[{"ID":"15550002000@s.whatsapp.net","participant":[]},{"ID":"15550003000@s.whatsapp.net"}],"recentStickers":[],"pastParticipants":[],"callLogRecords":[]}`)
+	emptyReport, err := Coverage(path, []string{empty})
+	if err != nil || emptyReport.HistoryComplete || emptyReport.OldBridgeAssessed {
+		t.Fatalf("empty %+v %v", emptyReport, err)
+	}
+	if emptyReport.Archives[0].Kind != "messages" || !emptyReport.Archives[0].MessageAudit || emptyReport.Archives[0].Conversations != 2 || emptyReport.Archives[0].EmptyConversations != 2 || emptyReport.Archives[0].Messages != 0 {
+		t.Fatalf("empty archive %+v", emptyReport.Archives[0])
+	}
+	mixed := write("mixed.json", `{"syncType":2,"chunkOrder":1,"progress":1,"conversations":[{"ID":"15550002000@s.whatsapp.net","endOfHistoryTransferType":0},{"ID":"15550002000@s.whatsapp.net","messages":[{"message":{"key":{"remoteJid":"15550002000@s.whatsapp.net","id":"synthetic-absent"}}},{"message":{"key":{"remoteJid":"15550002000@s.whatsapp.net","id":"synthetic-m1"}}}]}],"phoneNumberToLidMappings":[]}`)
+	mixedReport, err := Coverage(path, []string{mixed})
+	if err != nil || mixedReport.HistoryComplete || mixedReport.Archives[0].EmptyConversations != 1 || mixedReport.Archives[0].Present != 1 || mixedReport.Archives[0].Absent != 1 {
+		t.Fatalf("mixed %+v %v", mixedReport, err)
+	}
+	if mixedReport.Archives[0].AbsentIDs[0].ID != "synthetic-absent" {
+		t.Fatalf("absent %+v", mixedReport.Archives[0].AbsentIDs)
+	}
+	for _, item := range []struct {
+		name string
+		body string
+	}{
+		{"status.json", `{"syncType":1,"statusV3Messages":[],"chunkOrder":1,"phoneNumberToLidMappings":[]}`},
+		{"push.json", `{"syncType":4,"chunkOrder":1,"pushnames":[{"id":"synthetic-push"}]}`},
+		{"progress.json", `{"syncType":2,"chunkOrder":1,"progress":1}`},
+	} {
+		report, err := Coverage(path, []string{write(item.name, item.body)})
+		if err != nil || report.HistoryComplete || report.Archives[0].Kind != "metadata_only" || report.Archives[0].MessageAudit || report.Archives[0].Messages != 0 {
+			t.Fatalf("%s %+v %v", item.name, report, err)
+		}
+	}
+	if _, err := Coverage(path, []string{write("unknown.json", `{"syncType":3,"conversations":[],"notAField":true}`)}); err == nil {
+		t.Fatal("unknown top-level key was accepted")
+	}
+}
+
+func TestMediaReferencesFailClosed(t *testing.T) {
+	db, path := newSchemaDB(t)
+	insertSyntheticHistory(t, db)
+	if _, err := db.Exec(`UPDATE messages SET media_type='image', filename='synthetic-display', file_sha256=X'010203', media_key=X'0a0b0c' WHERE id='synthetic-m1'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO messages (id, chat_jid, device_id, sender, content, timestamp, filename) VALUES ('synthetic-dup', '15550002000@s.whatsapp.net', '15550001000@s.whatsapp.net', '15550002000@s.whatsapp.net', 'other', '2026-02-02 00:00:00', 'synthetic-display')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO messages (id, chat_jid, device_id, sender, content, timestamp, filename) VALUES ('synthetic-path', '15550002000@s.whatsapp.net', '15550001000@s.whatsapp.net', '15550002000@s.whatsapp.net', 'path', '2026-02-03 00:00:00', 'synthetic/path.pdf')`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	archive := filepath.Join(t.TempDir(), "status.json")
+	if err := os.WriteFile(archive, []byte(`{"syncType":1,"statusV3Messages":[],"chunkOrder":1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	report, err := MediaReferences(MediaRefRequest{DB: path, Archives: []string{archive}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.SubsetProven || report.WholeTreeCopyAllowed || report.WholeTreeFits || report.PurgeAllowed || report.HistoryComplete || report.OldBridgeAssessed || report.LocalPathStored || report.BytesSelected != nil {
+		t.Fatalf("flags %+v", report)
+	}
+	if report.AmbiguousDisplayNameGroups != 1 || report.PathShapedFilenames != 1 || report.RowsWithFilename < 2 || report.MetadataOnlyArchives != 1 || report.ArchiveLocalPaths != 0 {
+		t.Fatalf("counts %+v", report)
+	}
+	if report.Inventory.MeasuredByTool || report.Inventory.Files != 490698 || report.Inventory.LogicalGB != "129.21" || report.Inventory.AllocatedGB != "130.48" || report.Inventory.BoxFreeGB != "49.21" {
+		t.Fatalf("inventory %+v", report.Inventory)
+	}
+	if len(report.NextAdapterFields) < 6 {
+		t.Fatalf("evidence %+v", report.NextAdapterFields)
+	}
+	encoded, _ := json.Marshal(report)
+	for _, hidden := range []string{"synthetic-display", "synthetic/path.pdf", "010203", "0a0b0c", "synthetic hello"} {
+		if strings.Contains(string(encoded), hidden) {
+			t.Fatalf("report contains %s", hidden)
+		}
+	}
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "synthetic-display"), []byte("bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := MediaReferences(MediaRefRequest{DB: path, MediaRoot: root}); err == nil || !strings.Contains(err.Error(), "display") {
+		t.Fatalf("media root err %v", err)
+	}
+	var out, errBuf bytes.Buffer
+	if code := runOffline(&out, &errBuf, []string{"media-refs", "--db", path}); code != 0 || !strings.Contains(out.String(), `"subset_proven": false`) || strings.Contains(out.String(), `"history_complete": true`) {
+		t.Fatalf("cli %d %s %s", code, out.String(), errBuf.String())
 	}
 }
 

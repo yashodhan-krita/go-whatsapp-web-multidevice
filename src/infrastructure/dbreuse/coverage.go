@@ -20,15 +20,21 @@ type ArchiveMessage struct {
 
 // ArchiveCoverage is the overlap between one JSON archive and a snapshot.
 type ArchiveCoverage struct {
-	Path       string           `json:"path"`
-	Bytes      int64            `json:"bytes"`
-	SHA256     string           `json:"sha256"`
-	Messages   int              `json:"messages"`
-	Present    int              `json:"present"`
-	Absent     int              `json:"absent"`
-	OtherChat  int              `json:"other_chat"`
-	AbsentIDs  []ArchiveMessage `json:"absent_ids"`
-	OtherChats []ArchiveMessage `json:"other_chats"`
+	Path               string           `json:"path"`
+	Bytes              int64            `json:"bytes"`
+	SHA256             string           `json:"sha256"`
+	Kind               string           `json:"kind"`
+	MessageAudit       bool             `json:"message_audit"`
+	Conversations      int              `json:"conversations"`
+	EmptyConversations int              `json:"empty_conversations"`
+	TopLevel           []string         `json:"top_level"`
+	Messages           int              `json:"messages"`
+	Present            int              `json:"present"`
+	Absent             int              `json:"absent"`
+	OtherChat          int              `json:"other_chat"`
+	AbsentIDs          []ArchiveMessage `json:"absent_ids"`
+	OtherChats         []ArchiveMessage `json:"other_chats"`
+	Notes              []string         `json:"notes"`
 }
 
 // CoverageReport lists archive ids that are already in the snapshot.
@@ -38,6 +44,7 @@ type CoverageReport struct {
 	Archives              []ArchiveCoverage `json:"archives"`
 	HistoryComplete       bool              `json:"history_complete"`
 	HistoryCompleteReason string            `json:"history_complete_reason"`
+	OldBridgeAssessed     bool              `json:"old_bridge_assessed"`
 	Notes                 []string          `json:"notes"`
 }
 
@@ -48,10 +55,13 @@ func Coverage(dbPath string, archives []string) (*CoverageReport, error) {
 		Database:              dbPath,
 		Archives:              []ArchiveCoverage{},
 		HistoryComplete:       false,
+		OldBridgeAssessed:     false,
 		HistoryCompleteReason: historyCompleteNote + " An archive id that is already stored does not prove media, reactions, or older bridge rows, and it does not authorize a purge.",
 		Notes: []string{
 			"This is not an importer. Absent ids stay only in the archive file.",
-			"No old-bridge row format is read. A SQLite file or gzip stream is rejected.",
+			"No old-bridge row format is read. A SQLite file or gzip stream is rejected. That gap is unverified coverage, not permission to purge.",
+			"A history-sync file with no conversations field is metadata-only when every top-level key is a known history-sync field. Zero absent ids in that file is not message coverage.",
+			"A conversation without a messages field is empty. It is counted and is not a malformed archive.",
 			historyCompleteNote,
 		},
 	}
@@ -135,15 +145,29 @@ func coverArchive(path string, byPair map[string]struct{}, byID map[string][]str
 	if err != nil {
 		return nil, err
 	}
-	messages, err := readHistoryArchive(path)
+	parsed, err := readHistoryArchive(path)
 	out := &ArchiveCoverage{
 		Path: path, Bytes: info.Size(), SHA256: sum,
-		AbsentIDs: []ArchiveMessage{}, OtherChats: []ArchiveMessage{},
+		AbsentIDs: []ArchiveMessage{}, OtherChats: []ArchiveMessage{}, Notes: []string{}, TopLevel: []string{},
 	}
 	if err != nil {
 		return out, err
 	}
-	for _, message := range messages {
+	out.Kind = parsed.Kind
+	out.MessageAudit = parsed.MessageAudit
+	out.Conversations = parsed.Conversations
+	out.EmptyConversations = parsed.EmptyConversations
+	out.TopLevel = parsed.TopLevel
+	if !parsed.MessageAudit {
+		out.Notes = append(out.Notes, "metadata-only history sync: conversation messages were not audited, so zero absent ids is not coverage and does not authorize a purge")
+	}
+	if parsed.StatusMessagesPresent {
+		out.Notes = append(out.Notes, "statusV3Messages is present and was not audited as chat history")
+	}
+	if parsed.EmptyConversations > 0 {
+		out.Notes = append(out.Notes, "conversations without messages are counted separately and are not message coverage")
+	}
+	for _, message := range parsed.Messages {
 		out.Messages++
 		if _, ok := byPair[message.ChatJID+"\x00"+message.ID]; ok {
 			out.Present++
@@ -185,7 +209,31 @@ func hashFile(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func readHistoryArchive(path string) ([]ArchiveMessage, error) {
+type historyArchive struct {
+	Kind                  string
+	MessageAudit          bool
+	Conversations         int
+	EmptyConversations    int
+	TopLevel              []string
+	Messages              []ArchiveMessage
+	StatusMessagesPresent bool
+}
+
+func knownHistoryKey(key string) bool {
+	switch key {
+	case "syncType", "conversations", "statusV3Messages", "chunkOrder", "progress",
+		"pushnames", "globalSettings", "threadIDUserSecret", "threadDsTimeframeOffset",
+		"recentStickers", "pastParticipants", "callLogRecords", "aiWaitListState",
+		"phoneNumberToLidMappings", "companionMetaNonce", "shareableChatIdentifierEncryptionKey",
+		"accounts", "nctSalt", "inlineContacts", "inlineContactsProvided", "favoriteStickers",
+		"omittedConversations", "omittedConversationsProvided":
+		return true
+	default:
+		return false
+	}
+}
+
+func readHistoryArchive(path string) (*historyArchive, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -215,8 +263,8 @@ func readHistoryArchive(path string) ([]ArchiveMessage, error) {
 	if !ok || delim != '{' {
 		return nil, fmt.Errorf("%s is not a GOWA history-sync object", path)
 	}
-	var messages []ArchiveMessage
-	saw := false
+	parsed := &historyArchive{Kind: "metadata_only", TopLevel: []string{}, Messages: []ArchiveMessage{}}
+	sawConversations := false
 	for dec.More() {
 		keyToken, err := dec.Token()
 		if err != nil {
@@ -226,6 +274,13 @@ func readHistoryArchive(path string) ([]ArchiveMessage, error) {
 		if !ok {
 			return nil, fmt.Errorf("%s has a non-string key", path)
 		}
+		if !knownHistoryKey(key) {
+			return nil, fmt.Errorf("%s has unrecognized key %q", path, key)
+		}
+		if key == "statusV3Messages" {
+			parsed.StatusMessagesPresent = true
+		}
+		parsed.TopLevel = append(parsed.TopLevel, key)
 		if key != "conversations" {
 			var skip json.RawMessage
 			if err := dec.Decode(&skip); err != nil {
@@ -233,15 +288,13 @@ func readHistoryArchive(path string) ([]ArchiveMessage, error) {
 			}
 			continue
 		}
-		if saw {
+		if sawConversations {
 			return nil, fmt.Errorf("%s repeats conversations", path)
 		}
-		saw = true
-		parsed, err := decodeConversations(path, dec)
-		if err != nil {
+		sawConversations = true
+		if err := decodeConversations(path, dec, parsed); err != nil {
 			return nil, err
 		}
-		messages = append(messages, parsed...)
 	}
 	end, err := dec.Token()
 	if err != nil {
@@ -250,64 +303,116 @@ func readHistoryArchive(path string) ([]ArchiveMessage, error) {
 	if delim, ok := end.(json.Delim); !ok || delim != '}' {
 		return nil, fmt.Errorf("%s is not a GOWA history-sync object", path)
 	}
-	if !saw {
-		return nil, fmt.Errorf("%s has no conversations array; refusing an unrecognized archive", path)
+	if len(parsed.TopLevel) == 0 {
+		return nil, fmt.Errorf("%s is not a GOWA history-sync object", path)
 	}
-	return messages, nil
+	sort.Strings(parsed.TopLevel)
+	if sawConversations {
+		parsed.Kind = "messages"
+		parsed.MessageAudit = true
+	}
+	return parsed, nil
 }
 
-func decodeConversations(path string, dec *json.Decoder) ([]ArchiveMessage, error) {
+func decodeConversations(path string, dec *json.Decoder, parsed *historyArchive) error {
 	token, err := dec.Token()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if delim, ok := token.(json.Delim); !ok || delim != '[' {
-		return nil, fmt.Errorf("%s conversations is not an array", path)
+		return fmt.Errorf("%s conversations is not an array", path)
 	}
-	var out []ArchiveMessage
 	for dec.More() {
-		var conv struct {
-			ID       string `json:"id"`
-			Messages []struct {
-				Message struct {
-					Key struct {
-						RemoteJID string `json:"remoteJid"`
-						ID        string `json:"id"`
-					} `json:"key"`
-				} `json:"message"`
-			} `json:"messages"`
-		}
+		var conv map[string]json.RawMessage
 		if err := dec.Decode(&conv); err != nil {
-			return nil, fmt.Errorf("%s conversation: %w", path, err)
+			return fmt.Errorf("%s conversation: %w", path, err)
 		}
-		if conv.Messages == nil {
-			return nil, fmt.Errorf("%s conversation %s has no messages array", path, conv.ID)
+		parsed.Conversations++
+		chat, err := conversationID(conv)
+		if err != nil {
+			return fmt.Errorf("%s conversation: %w", path, err)
 		}
-		for _, item := range conv.Messages {
+		rawMessages, hasMessages := conv["messages"]
+		if !hasMessages || string(rawMessages) == "null" {
+			parsed.EmptyConversations++
+			continue
+		}
+		if len(rawMessages) == 0 || rawMessages[0] != '[' {
+			return fmt.Errorf("%s conversation %s messages is not an array", path, chat)
+		}
+		var items []struct {
+			Message struct {
+				Key struct {
+					RemoteJID string `json:"remoteJid"`
+					ID        string `json:"id"`
+				} `json:"key"`
+			} `json:"message"`
+		}
+		if err := json.Unmarshal(rawMessages, &items); err != nil {
+			return fmt.Errorf("%s conversation %s: %w", path, chat, err)
+		}
+		if len(items) == 0 {
+			parsed.EmptyConversations++
+			continue
+		}
+		for _, item := range items {
 			id := item.Message.Key.ID
 			remote := item.Message.Key.RemoteJID
 			if id == "" {
-				return nil, fmt.Errorf("%s has a message without key.id", path)
+				return fmt.Errorf("%s has a message without key.id", path)
 			}
-			chat := conv.ID
-			if chat == "" {
-				chat = remote
+			messageChat := chat
+			if messageChat == "" {
+				messageChat = remote
 			}
-			if chat == "" {
-				return nil, fmt.Errorf("%s message %s has no chat jid", path, id)
+			if messageChat == "" {
+				return fmt.Errorf("%s message %s has no chat jid", path, id)
 			}
-			if remote != "" && conv.ID != "" && remote != conv.ID {
-				return nil, fmt.Errorf("%s message %s chat id %s disagrees with remoteJid %s", path, id, conv.ID, remote)
+			if remote != "" && chat != "" && remote != chat {
+				return fmt.Errorf("%s message %s chat id %s disagrees with remoteJid %s", path, id, chat, remote)
 			}
-			out = append(out, ArchiveMessage{ChatJID: chat, ID: id})
+			parsed.Messages = append(parsed.Messages, ArchiveMessage{ChatJID: messageChat, ID: id})
 		}
 	}
 	end, err := dec.Token()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if delim, ok := end.(json.Delim); !ok || delim != ']' {
-		return nil, fmt.Errorf("%s conversations did not end", path)
+		return fmt.Errorf("%s conversations did not end", path)
 	}
-	return out, nil
+	return nil
+}
+
+func conversationID(conv map[string]json.RawMessage) (string, error) {
+	primary, hasPrimary := conv["ID"]
+	alt, hasAlt := conv["id"]
+	if !hasPrimary && !hasAlt {
+		return "", nil
+	}
+	read := func(raw json.RawMessage) (string, error) {
+		var id string
+		if err := json.Unmarshal(raw, &id); err != nil {
+			return "", fmt.Errorf("chat id is not a string")
+		}
+		return id, nil
+	}
+	if hasPrimary && hasAlt {
+		left, err := read(primary)
+		if err != nil {
+			return "", err
+		}
+		right, err := read(alt)
+		if err != nil {
+			return "", err
+		}
+		if left != right {
+			return "", fmt.Errorf("ID and id disagree")
+		}
+		return left, nil
+	}
+	if hasPrimary {
+		return read(primary)
+	}
+	return read(alt)
 }

@@ -184,8 +184,9 @@ func init() {
 			work, _ := cmd.Flags().GetString("work-dir")
 			out, _ := cmd.Flags().GetString("out")
 			live, _ := cmd.Flags().GetBool("allow-live-validation")
+			base, _ := cmd.Flags().GetString("base")
 			report, err := dbreuse.Overlay(cmd.Context(), dbreuse.OverlayRequest{
-				Source: source, Target: target, MapPath: mapping, WorkDir: work, Out: out, AllowLiveValidation: live,
+				Source: source, Target: target, MapPath: mapping, WorkDir: work, Out: out, AllowLiveValidation: live, Base: base,
 			})
 			if report != nil {
 				if writeErr := writeJSON(cmd.OutOrStdout(), report); writeErr != nil {
@@ -201,7 +202,36 @@ func init() {
 	overlayCmd.Flags().String("work-dir", "", "directory for read-only snapshots")
 	overlayCmd.Flags().String("out", "", "new staged database")
 	overlayCmd.Flags().Bool("allow-live-validation", false, "allow -shm on the inputs")
+	overlayCmd.Flags().String("base", "source", "source keeps the source registry; target keeps the target registry")
 	dbReuseCmd.AddCommand(overlayCmd)
+
+	mediaRefsCmd := &cobra.Command{
+		Use:   "media-refs",
+		Short: "Report message media fields without selecting local bytes",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			path, _ := cmd.Flags().GetString("db")
+			archives, _ := cmd.Flags().GetStringArray("archive")
+			root, _ := cmd.Flags().GetString("media-root")
+			report, err := dbreuse.MediaReferences(dbreuse.MediaRefRequest{DB: path, Archives: archives, MediaRoot: root})
+			if report != nil {
+				if writeErr := writeJSON(cmd.OutOrStdout(), report); writeErr != nil {
+					return writeErr
+				}
+			}
+			if err != nil {
+				return err
+			}
+			if report != nil && (report.SubsetProven || report.WholeTreeCopyAllowed || report.PurgeAllowed || report.HistoryComplete) {
+				return fmt.Errorf("media-refs must not claim a proven byte subset")
+			}
+			return nil
+		},
+	}
+	mediaRefsCmd.Flags().String("db", "", "chatstorage snapshot")
+	mediaRefsCmd.Flags().StringArray("archive", nil, "history-sync JSON file")
+	mediaRefsCmd.Flags().String("media-root", "", "refused; display names are not matched to a tree")
+	dbReuseCmd.AddCommand(mediaRefsCmd)
 
 	coverageCmd := &cobra.Command{
 		Use:   "coverage",

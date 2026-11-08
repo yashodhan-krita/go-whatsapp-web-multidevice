@@ -47,6 +47,10 @@ type OverlayRequest struct {
 	WorkDir             string
 	Out                 string
 	AllowLiveValidation bool
+	// Base is "source" or "target". Empty means source, which keeps the Mac
+	// registry and cannot represent a box-only account. "target" keeps the box
+	// registry and session identity and copies mapped incoming history onto it.
+	Base string
 }
 
 // RowConflict identifies a row whose payload differs. Bodies are not included.
@@ -55,6 +59,7 @@ type RowConflict struct {
 	DeviceID string `json:"device_id"`
 	ChatJID  string `json:"chat_jid,omitempty"`
 	ID       string `json:"id"`
+	Class    string `json:"class,omitempty"`
 }
 
 // AmbiguousMessage is one message id stored under more than one chat.
@@ -75,25 +80,29 @@ type ChatDifference struct {
 
 // OverlayReport is the staged copy result. Applied is false when nothing was published.
 type OverlayReport struct {
-	Applied               bool               `json:"applied"`
-	Output                string             `json:"output,omitempty"`
-	SourceSnapshot        string             `json:"source_snapshot,omitempty"`
-	TargetSnapshot        string             `json:"target_snapshot,omitempty"`
-	InsertedMessages      []MessageRef       `json:"inserted_messages"`
-	InsertedChats         int                `json:"inserted_chats"`
-	InsertedReactions     int                `json:"inserted_reactions"`
-	InsertedEdits         int                `json:"inserted_edits"`
-	InsertedPolls         int                `json:"inserted_polls"`
-	AlreadyPresent        int                `json:"already_present"`
-	Conflicts             []RowConflict      `json:"conflicts"`
-	Ambiguous             []AmbiguousMessage `json:"ambiguous"`
-	UnmappedDeviceIDs     []string           `json:"unmapped_device_ids"`
-	ChatDifferences       []ChatDifference   `json:"chat_differences"`
-	CutoverReady          bool               `json:"cutover_ready"`
-	HistoryComplete       bool               `json:"history_complete"`
-	HistoryCompleteReason string             `json:"history_complete_reason"`
-	Reasons               []string           `json:"reasons"`
-	Notes                 []string           `json:"notes"`
+	Applied                bool               `json:"applied"`
+	Output                 string             `json:"output,omitempty"`
+	SourceSnapshot         string             `json:"source_snapshot,omitempty"`
+	TargetSnapshot         string             `json:"target_snapshot,omitempty"`
+	InsertedMessages       []MessageRef       `json:"inserted_messages"`
+	InsertedChats          int                `json:"inserted_chats"`
+	InsertedReactions      int                `json:"inserted_reactions"`
+	InsertedEdits          int                `json:"inserted_edits"`
+	InsertedPolls          int                `json:"inserted_polls"`
+	AlreadyPresent         int                `json:"already_present"`
+	Conflicts              []RowConflict      `json:"conflicts"`
+	Ambiguous              []AmbiguousMessage `json:"ambiguous"`
+	UnmappedDeviceIDs      []string           `json:"unmapped_device_ids"`
+	PreservedBaseDeviceIDs []string           `json:"preserved_base_device_ids"`
+	Base                   string             `json:"base"`
+	ColumnDiffs            []ColumnDiff       `json:"column_diffs"`
+	EnrichmentFills        int                `json:"enrichment_fills"`
+	ChatDifferences        []ChatDifference   `json:"chat_differences"`
+	CutoverReady           bool               `json:"cutover_ready"`
+	HistoryComplete        bool               `json:"history_complete"`
+	HistoryCompleteReason  string             `json:"history_complete_reason"`
+	Reasons                []string           `json:"reasons"`
+	Notes                  []string           `json:"notes"`
 }
 
 type verifiedAccount struct {
@@ -106,6 +115,7 @@ type planned struct {
 	reactions []sqlRow
 	edits     []sqlRow
 	polls     []sqlRow
+	fills     []columnFill
 }
 
 // Overlay writes a new database. Source and target paths are not modified.
@@ -193,7 +203,24 @@ func Overlay(ctx context.Context, req OverlayRequest) (*OverlayReport, error) {
 	}
 	defer dstDB.Close()
 
-	plan, err := buildOverlayPlan(report, srcDB, dstDB, verified)
+	baseName := req.Base
+	if baseName == "" {
+		baseName = "source"
+	}
+	if baseName != "source" && baseName != "target" {
+		return report, fmt.Errorf("overlay --base must be source or target")
+	}
+	report.Base = baseName
+	baseDB, incomingDB := srcDB, dstDB
+	baseSnap := sourceSnap
+	if baseName == "target" {
+		baseDB, incomingDB = dstDB, srcDB
+		baseSnap = targetSnap
+		report.Notes = append(report.Notes, "The staged file copies the target registry, schedules, and Chatwoot rows. Mapped incoming history is added onto that registry. Base accounts that are not in the map stay in place and are not invented on the incoming side.")
+	} else {
+		report.Notes = append(report.Notes, "Base is the source registry. An account that exists only on the target cannot be mapped and blocks this direction.")
+	}
+	plan, err := buildOverlayPlan(report, baseDB, incomingDB, verified, baseName)
 	if err != nil {
 		report.Reasons = append(report.Reasons, err.Error())
 		return report, err
@@ -201,7 +228,7 @@ func Overlay(ctx context.Context, req OverlayRequest) (*OverlayReport, error) {
 	if rejected(report) {
 		return report, ErrRejected
 	}
-	if err := publishOverlay(ctx, sourceSnap, req.Out, plan); err != nil {
+	if err := publishOverlay(ctx, baseSnap, req.Out, plan); err != nil {
 		os.Remove(req.Out)
 		os.Remove(req.Out + "-wal")
 		os.Remove(req.Out + "-shm")
@@ -217,19 +244,21 @@ func Overlay(ctx context.Context, req OverlayRequest) (*OverlayReport, error) {
 
 func newOverlayReport() *OverlayReport {
 	return &OverlayReport{
-		InsertedMessages:      []MessageRef{},
-		Conflicts:             []RowConflict{},
-		Ambiguous:             []AmbiguousMessage{},
-		UnmappedDeviceIDs:     []string{},
-		ChatDifferences:       []ChatDifference{},
-		Reasons:               []string{},
-		CutoverReady:          false,
-		HistoryComplete:       false,
-		HistoryCompleteReason: historyCompleteNote,
+		InsertedMessages:       []MessageRef{},
+		Conflicts:              []RowConflict{},
+		Ambiguous:              []AmbiguousMessage{},
+		UnmappedDeviceIDs:      []string{},
+		PreservedBaseDeviceIDs: []string{},
+		ColumnDiffs:            []ColumnDiff{},
+		ChatDifferences:        []ChatDifference{},
+		Reasons:                []string{},
+		CutoverReady:           false,
+		HistoryComplete:        false,
+		HistoryCompleteReason:  historyCompleteNote,
 		Notes: []string{
 			"The output is a new file. Source and target are not modified.",
-			"devices, scheduled_sends, and Chatwoot tables are the source rows, unchanged.",
-			"Message device_id is rewritten to the source storage JID. chat_jid and sender are not rewritten.",
+			"devices, scheduled_sends, and Chatwoot tables are copied from the overlay base and are not edited.",
+			"Message device_id is rewritten to the base storage JID. chat_jid and sender are not rewritten.",
 			"Reconcile still does not merge. This staged copy is the only overlay, and it is not a cutover by itself.",
 			historyCompleteNote,
 		},
@@ -439,12 +468,16 @@ func splitJID(raw string) (user, server string, device int, err error) {
 	return user, server, device, nil
 }
 
-func buildOverlayPlan(report *OverlayReport, srcDB, dstDB queryer, accounts []verifiedAccount) (*planned, error) {
-	sourceOf := map[string]struct{}{}
+func buildOverlayPlan(report *OverlayReport, srcDB, dstDB queryer, accounts []verifiedAccount, baseName string) (*planned, error) {
+	baseIDs := map[string]struct{}{}
 	targetOf := map[string]string{}
 	for _, account := range accounts {
-		sourceOf[account.mapping.SourceStorageJID] = struct{}{}
-		targetOf[account.mapping.TargetStorageJID] = account.mapping.SourceStorageJID
+		incoming, baseID := account.mapping.TargetStorageJID, account.mapping.SourceStorageJID
+		if baseName == "target" {
+			incoming, baseID = account.mapping.SourceStorageJID, account.mapping.TargetStorageJID
+		}
+		targetOf[incoming] = baseID
+		baseIDs[baseID] = struct{}{}
 	}
 	srcMessages, err := readHistory(srcDB, "messages")
 	if err != nil {
@@ -479,12 +512,14 @@ func buildOverlayPlan(report *OverlayReport, srcDB, dstDB queryer, accounts []ve
 		}
 		set[chat] = struct{}{}
 	}
+	preserved := map[string]struct{}{}
 	for _, row := range srcMessages {
 		device, err := rowString(row, "device_id")
 		if err != nil {
 			return nil, err
 		}
-		if _, ok := sourceOf[device]; !ok {
+		if _, ok := baseIDs[device]; !ok {
+			preserved[device] = struct{}{}
 			continue
 		}
 		id, err := rowString(row, "id")
@@ -496,6 +531,22 @@ func buildOverlayPlan(report *OverlayReport, srcDB, dstDB queryer, accounts []ve
 			return nil, err
 		}
 		addChat(device, id, chat)
+	}
+	baseEditRows, err := readHistory(srcDB, "message_edits")
+	if err != nil {
+		return nil, err
+	}
+	incomingEditRows, err := readHistory(dstDB, "message_edits")
+	if err != nil {
+		return nil, err
+	}
+	baseEditIndex, err := indexEdits(baseEditRows)
+	if err != nil {
+		return nil, err
+	}
+	incomingEditIndex, err := indexEdits(incomingEditRows)
+	if err != nil {
+		return nil, err
 	}
 	unmapped := map[string]struct{}{}
 	for _, row := range dstMessages {
@@ -538,7 +589,22 @@ func buildOverlayPlan(report *OverlayReport, srcDB, dstDB queryer, accounts []ve
 			report.AlreadyPresent++
 			continue
 		}
-		report.Conflicts = append(report.Conflicts, RowConflict{Table: "messages", DeviceID: sourceDevice, ChatJID: chat, ID: id})
+		baseContent, _ := rowString(existing, "content")
+		incomingContent, _ := rowString(rewritten, "content")
+		baseDevice, _ := rowString(existing, "device_id")
+		linked := append([][2]string{}, baseEditIndex[baseDevice+"\x00"+chat+"\x00"+id]...)
+		linked = append(linked, incomingEditIndex[device+"\x00"+chat+"\x00"+id]...)
+		diffs, fills, conflict, err := classifyMessage(existing, rewritten, baseContent, incomingContent, linked)
+		if err != nil {
+			return nil, err
+		}
+		report.ColumnDiffs = append(report.ColumnDiffs, diffs...)
+		if conflict != nil {
+			report.Conflicts = append(report.Conflicts, *conflict)
+			continue
+		}
+		plan.fills = append(plan.fills, fills...)
+		report.AlreadyPresent++
 	}
 	for key, chats := range idChats {
 		if len(chats) < 2 {
@@ -570,8 +636,16 @@ func buildOverlayPlan(report *OverlayReport, srcDB, dstDB queryer, accounts []ve
 		report.UnmappedDeviceIDs = append(report.UnmappedDeviceIDs, id)
 	}
 	sort.Strings(report.UnmappedDeviceIDs)
+	for id := range preserved {
+		report.PreservedBaseDeviceIDs = append(report.PreservedBaseDeviceIDs, id)
+	}
+	sort.Strings(report.PreservedBaseDeviceIDs)
+	report.EnrichmentFills = len(plan.fills)
+	if len(report.PreservedBaseDeviceIDs) > 0 {
+		report.Notes = append(report.Notes, "Base device ids that are not in the account map stay on the staged copy. They are not invented on the incoming side.")
+	}
 	if len(report.UnmappedDeviceIDs) > 0 {
-		report.Reasons = append(report.Reasons, "target history has device ids that are not in the account map: "+strings.Join(report.UnmappedDeviceIDs, ", "))
+		report.Reasons = append(report.Reasons, "incoming history has unmapped device ids that are not in the account map: "+strings.Join(report.UnmappedDeviceIDs, ", "))
 	}
 	if len(report.Ambiguous) > 0 {
 		report.Reasons = append(report.Reasons, "message ids appear under more than one chat JID; refusing to guess a LID or phone association")
@@ -749,7 +823,14 @@ func planChildren(report *OverlayReport, plan *planned, srcDB, dstDB queryer, ta
 				return err
 			}
 			if !same {
-				report.Conflicts = append(report.Conflicts, RowConflict{Table: spec.table, DeviceID: sourceDevice, ChatJID: chat, ID: id})
+				provenanceOnly, err := onlyProvenanceDiff(current, rewritten)
+				if err != nil {
+					return err
+				}
+				if provenanceOnly {
+					continue
+				}
+				report.Conflicts = append(report.Conflicts, RowConflict{Table: spec.table, DeviceID: sourceDevice, ChatJID: chat, ID: id, Class: "genuine_content"})
 			}
 		}
 		*spec.counter = len(*spec.assign)
@@ -854,6 +935,31 @@ func publishOverlay(ctx context.Context, sourceSnap, out string, plan *planned) 
 				tx.Rollback()
 				return fmt.Errorf("insert %s: %w", batch.table, err)
 			}
+		}
+	}
+	for _, fill := range plan.fills {
+		if !enrichmentColumn(fill.column) {
+			tx.Rollback()
+			return fmt.Errorf("refusing to fill %s", fill.column)
+		}
+		quoted, err := quoteIdent(fill.column)
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+		res, err := tx.Exec(`UPDATE messages SET `+quoted+` = ? WHERE id = ? AND chat_jid = ? AND device_id = ?`, fill.value, fill.id, fill.chat, fill.device)
+		if err != nil {
+			tx.Rollback()
+			return fmt.Errorf("fill %s: %w", fill.column, err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+		if n != 1 {
+			tx.Rollback()
+			return fmt.Errorf("fill %s matched %d rows", fill.column, n)
 		}
 	}
 	after, err := fingerprintTables(tx, preservedTables)
