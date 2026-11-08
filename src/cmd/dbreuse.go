@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/dbreuse"
 	"github.com/spf13/cobra"
@@ -18,10 +19,14 @@ var dbReuseCmd = &cobra.Command{
 The subcommands do not connect to WhatsApp, send messages, mark chats read,
 import history archives, open whatsapp.db, or delete rows. snapshot writes one
 consistent database file, including an open WAL. preflight reports schema and
-registry alignment. reconcile lists message ids that exist on only one side.
-materialize-media copies media bytes and follows symlinks.
+registry alignment. gate blocks a real cutover unless the on-disk schema matches
+the verified Mac revision and the writers were attested frozen. reconcile lists
+message ids that exist on only one side and does not merge. overlay writes
+target-only rows into a new file. coverage audits history JSON without inserting
+it. materialize-media copies media bytes and follows symlinks.
 
-Dry-run is the whole command set: nothing here replaces a live database.`,
+The offline db-reuse binaries are the copies that cannot start WhatsApp.
+history_complete is false in every report. Nothing here replaces a live database.`,
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		return cmd.Help()
@@ -41,15 +46,24 @@ func init() {
 			if src == "" || dst == "" {
 				return fmt.Errorf("snapshot requires --source and --out")
 			}
-			if err := dbreuse.Snapshot(cmd.Context(), src, dst); err != nil {
-				return err
+			live, _ := cmd.Flags().GetBool("allow-live-validation")
+			writers, _ := cmd.Flags().GetString("attest-writers")
+			result, err := dbreuse.SnapshotWithOptions(cmd.Context(), src, dst, dbreuse.SnapshotOptions{
+				AllowLiveValidation: live,
+				AttestWriters:       splitCSV(writers),
+			})
+			if result != nil {
+				if writeErr := writeJSON(cmd.OutOrStdout(), result); writeErr != nil {
+					return writeErr
+				}
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "snapshot %s\n", dst)
-			return nil
+			return err
 		},
 	}
 	snapshotCmd.Flags().String("source", "", "path to chatstorage.db, with its -wal left beside it")
 	snapshotCmd.Flags().String("out", "", "new snapshot file to create")
+	snapshotCmd.Flags().Bool("allow-live-validation", false, "copy while -shm exists; not a cutover file")
+	snapshotCmd.Flags().String("attest-writers", "", "source-gowa,source-periodic-merge,target-gowa")
 	dbReuseCmd.AddCommand(snapshotCmd)
 
 	preflightCmd := &cobra.Command{
@@ -158,6 +172,117 @@ func init() {
 	mediaCmd.Flags().String("dest", "", "directory that receives regular files")
 	mediaCmd.Flags().String("out", "", "optional JSON manifest path")
 	dbReuseCmd.AddCommand(mediaCmd)
+
+	overlayCmd := &cobra.Command{
+		Use:   "overlay",
+		Short: "Stage target-only history onto a new copy of the source database",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			source, _ := cmd.Flags().GetString("source")
+			target, _ := cmd.Flags().GetString("target")
+			mapping, _ := cmd.Flags().GetString("map")
+			work, _ := cmd.Flags().GetString("work-dir")
+			out, _ := cmd.Flags().GetString("out")
+			live, _ := cmd.Flags().GetBool("allow-live-validation")
+			report, err := dbreuse.Overlay(cmd.Context(), dbreuse.OverlayRequest{
+				Source: source, Target: target, MapPath: mapping, WorkDir: work, Out: out, AllowLiveValidation: live,
+			})
+			if report != nil {
+				if writeErr := writeJSON(cmd.OutOrStdout(), report); writeErr != nil {
+					return writeErr
+				}
+			}
+			return err
+		},
+	}
+	overlayCmd.Flags().String("source", "", "source chatstorage.db")
+	overlayCmd.Flags().String("target", "", "target chatstorage.db")
+	overlayCmd.Flags().String("map", "", "account mapping JSON")
+	overlayCmd.Flags().String("work-dir", "", "directory for read-only snapshots")
+	overlayCmd.Flags().String("out", "", "new staged database")
+	overlayCmd.Flags().Bool("allow-live-validation", false, "allow -shm on the inputs")
+	dbReuseCmd.AddCommand(overlayCmd)
+
+	coverageCmd := &cobra.Command{
+		Use:   "coverage",
+		Short: "Report which history-sync JSON ids are already in a snapshot",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			path, _ := cmd.Flags().GetString("db")
+			archives, _ := cmd.Flags().GetStringArray("archive")
+			report, err := dbreuse.Coverage(path, archives)
+			if report != nil {
+				if writeErr := writeJSON(cmd.OutOrStdout(), report); writeErr != nil {
+					return writeErr
+				}
+			}
+			if err != nil {
+				return err
+			}
+			if report != nil && report.HistoryComplete {
+				return fmt.Errorf("coverage must not claim complete history")
+			}
+			return nil
+		},
+	}
+	coverageCmd.Flags().String("db", "", "chatstorage snapshot")
+	coverageCmd.Flags().StringArray("archive", nil, "history-sync JSON file")
+	dbReuseCmd.AddCommand(coverageCmd)
+
+	gateCmd := &cobra.Command{
+		Use:   "gate",
+		Short: "Block real cutover unless schema, revision, and writer checks pass",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			path, _ := cmd.Flags().GetString("db")
+			revision, _ := cmd.Flags().GetString("expect-revision")
+			writers, _ := cmd.Flags().GetString("attest-writers")
+			target, _ := cmd.Flags().GetString("target")
+			work, _ := cmd.Flags().GetString("work-dir")
+			report, err := dbreuse.Gate(cmd.Context(), dbreuse.GateRequest{
+				DB: path, ExpectRevision: revision, Writers: splitCSV(writers), Target: target, WorkDir: work,
+			})
+			if report != nil {
+				if writeErr := writeJSON(cmd.OutOrStdout(), report); writeErr != nil {
+					return writeErr
+				}
+			}
+			if err != nil {
+				return err
+			}
+			if report == nil || report.RealCutoverBlocked || !report.MechanicalGatesPassed {
+				return fmt.Errorf("real cutover is blocked")
+			}
+			return nil
+		},
+	}
+	gateCmd.Flags().String("db", "", "single-file chatstorage snapshot")
+	gateCmd.Flags().String("expect-revision", "", "full 40-character source SHA")
+	gateCmd.Flags().String("attest-writers", "", "source-gowa,source-periodic-merge,target-gowa")
+	gateCmd.Flags().String("target", "", "target chatstorage.db")
+	gateCmd.Flags().String("work-dir", "", "required with --target")
+	dbReuseCmd.AddCommand(gateCmd)
+
+	revisionCmd := &cobra.Command{
+		Use:   "revision",
+		Short: "Print the verified installed Mac revision record",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			rev := dbreuse.InstalledRevision()
+			if rev.HistoryComplete || rev.ForkBaseIsInstalled || rev.DatabaseProvesRevision {
+				return fmt.Errorf("revision record is inconsistent")
+			}
+			return writeJSON(cmd.OutOrStdout(), rev)
+		},
+	}
+	dbReuseCmd.AddCommand(revisionCmd)
+}
+
+func splitCSV(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	return strings.Split(raw, ",")
 }
 
 func writeJSON(w interface{ Write([]byte) (int, error) }, value any) error {

@@ -5,12 +5,89 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
+// SnapshotOptions controls whether a copy may be taken while a writer is
+// connected. Snapshot always leaves CutoverReady false; schema and identity
+// are decided by Gate.
+type SnapshotOptions struct {
+	AllowLiveValidation bool
+	AttestWriters       []string
+}
+
+// SnapshotResult describes a new snapshot file. CutoverReady is always false.
+type SnapshotResult struct {
+	Path            string   `json:"path"`
+	SourceWALBytes  int64    `json:"source_wal_bytes"`
+	SourceSHM       bool     `json:"source_shm"`
+	WritersAttested []string `json:"writers_attested"`
+	LiveValidation  bool     `json:"live_validation"`
+	CutoverReady    bool     `json:"cutover_ready"`
+	HistoryComplete bool     `json:"history_complete"`
+	Reasons         []string `json:"reasons"`
+}
+
 // Snapshot copies src into dst as one consistent SQLite file.
+// It is the comparison copy used by reconcile and allows a live -shm.
+// A cutover copy must use SnapshotWithOptions after the writers are frozen.
 // The SQLite backup API reads committed pages, including an uncheckpointed
 // WAL, and does not rewrite src. dst must not already exist.
 func Snapshot(ctx context.Context, src, dst string) error {
+	return snapshot(ctx, src, dst)
+}
+
+// SnapshotWithOptions refuses a connected writer unless live validation is
+// requested, and refuses a freeze attestation that disagrees with -shm.
+func SnapshotWithOptions(ctx context.Context, src, dst string, opt SnapshotOptions) (*SnapshotResult, error) {
+	writers, err := normalizeWriters(opt.AttestWriters)
+	if err != nil {
+		return nil, err
+	}
+	walBytes, _, err := siblingFile(src, "-wal")
+	if err != nil {
+		return nil, err
+	}
+	_, shm, err := siblingFile(src, "-shm")
+	if err != nil {
+		return nil, err
+	}
+	result := &SnapshotResult{
+		SourceWALBytes:  walBytes,
+		SourceSHM:       shm,
+		WritersAttested: writers,
+		HistoryComplete: false,
+		CutoverReady:    false,
+		Reasons:         []string{},
+	}
+	if opt.AllowLiveValidation && len(writers) > 0 {
+		return result, fmt.Errorf("allow-live-validation cannot be combined with a freeze attestation")
+	}
+	if shm && len(writers) > 0 {
+		return result, fmt.Errorf("refusing a freeze attestation while %s-shm exists; a writer is still connected", src)
+	}
+	if shm && !opt.AllowLiveValidation {
+		return result, fmt.Errorf("source -shm exists; stop source GOWA, the periodic merge writer, and target GOWA before a cutover snapshot, or pass allow-live-validation for a non-cutover copy")
+	}
+	missing := missingWriters(writers)
+	if !opt.AllowLiveValidation && len(missing) > 0 {
+		return result, fmt.Errorf("a cutover snapshot requires attested quiesced writers: %s", strings.Join(missing, ", "))
+	}
+	if opt.AllowLiveValidation {
+		result.LiveValidation = true
+		result.Reasons = append(result.Reasons, "live validation snapshot; writers were not frozen and this file is not a cutover artifact")
+	}
+	if err := snapshot(ctx, src, dst); err != nil {
+		return result, err
+	}
+	result.Path = dst
+	result.Reasons = append(result.Reasons, "snapshot does not check schema, account identity, or history completeness")
+	result.CutoverReady = false
+	result.HistoryComplete = false
+	return result, nil
+}
+
+func snapshot(ctx context.Context, src, dst string) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}

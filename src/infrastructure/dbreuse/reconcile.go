@@ -43,6 +43,7 @@ type ReconcileReport struct {
 	Changed               []MessageRef  `json:"changed"`
 	SameCount             int           `json:"same_count"`
 	Chats                 []ChatSummary `json:"chats"`
+	Warnings              []string      `json:"warnings"`
 	Notes                 []string      `json:"notes"`
 }
 
@@ -76,12 +77,21 @@ func Reconcile(ctx context.Context, source, target, workDir string) (*ReconcileR
 		TargetOnly:            []MessageRef{},
 		Changed:               []MessageRef{},
 		Chats:                 []ChatSummary{},
+		Warnings:              []string{},
 		HistoryComplete:       false,
 		HistoryCompleteReason: historyCompleteNote + " Target-only rows remain in the target snapshot and are not merged.",
 		Notes: []string{
 			"Adopting the source snapshot as the runtime chatstorage.db leaves target-only messages in the target snapshot only.",
 			"This comparison uses the stored device_id, chat_jid, and message id. It does not rewrite JIDs.",
+			"Reconcile does not merge and is not a cutover snapshot. Freeze source GOWA, the source periodic merge writer, and target GOWA before the snapshot that will be installed.",
 		},
+	}
+	for _, path := range []string{source, target} {
+		if _, exists, err := siblingFile(path, "-shm"); err != nil {
+			return nil, err
+		} else if exists {
+			report.Warnings = append(report.Warnings, path+" has -shm; a writer may still be connected, so this comparison can race a later commit")
+		}
 	}
 	srcDB, err := openSQLite(sourceSnap, true)
 	if err != nil {

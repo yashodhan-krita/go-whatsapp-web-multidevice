@@ -18,7 +18,7 @@ const (
 	schemaV970Tag       = 49
 	schemaThisFork      = 50
 	schemaOfficialV990  = 54
-	historyCompleteNote = "A reusable chatstorage file is not a complete WhatsApp history. Rows that were never stored, and history-*.json archives, are not in this database."
+	historyCompleteNote = "These tools never set history_complete true. A reusable chatstorage file is not a complete WhatsApp history. Rows that were never stored, and history-*.json archives, are not proved present by snapshot, preflight, reconcile, overlay, or coverage."
 )
 
 // Preflight is the reuse decision for one chatstorage database.
@@ -65,6 +65,7 @@ func Check(path string) (*Preflight, error) {
 			"chatstorage.db is the history and registry file. whatsapp.db is the session and is not opened here.",
 			"History queries use devices.jid when it is set, otherwise devices.device_id.",
 			"scheduled_sends.device_id is the registry slot id, not the history storage id.",
+			"The schema version does not identify the binary. This fork's tree is not the installed Mac revision.",
 			historyCompleteNote,
 		},
 	}
