@@ -13,6 +13,9 @@
 // the private audit. legacy-schema reports a non-session SQLite catalog and
 // does not read rows. legacy-coverage and legacy-import read a declared bridge
 // file whose hash matches the map; import appends missing messages only.
+// legacy-verify re-reads those files and requires each retained original to
+// match the private audit payload, or the staged row when no extra column
+// was dropped.
 // media-refs counts message media fields and
 // does not select local bytes.
 package dbreuse

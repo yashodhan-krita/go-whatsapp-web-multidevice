@@ -28,6 +28,7 @@ It has no rest command. history_complete is false in every report.
   legacy-schema --db FILE
   legacy-coverage --db FILE --map FILE
   legacy-import --db FILE --map FILE [--audit FILE]
+  legacy-verify --db FILE --map FILE [--audit FILE]
   gate --db FILE --expect-revision SHA --attest-writers LIST [--target DB --work-dir DIR]
 
 --attest-writers must be exactly:
@@ -75,6 +76,8 @@ func runOffline(stdout, stderr io.Writer, args []string) int {
 		return cmdLegacyCoverage(stdout, stderr, args[1:])
 	case "legacy-import":
 		return cmdLegacyImport(stdout, stderr, args[1:])
+	case "legacy-verify":
+		return cmdLegacyVerify(stdout, stderr, args[1:])
 	case "gate":
 		return cmdGate(stdout, stderr, args[1:])
 	default:
@@ -291,6 +294,19 @@ func cmdLegacyImport(stdout, stderr io.Writer, args []string) int {
 	}
 	report, err := LegacyImport(context.Background(), LegacyRequest{Staged: *path, MapPath: *mapping, Audit: *audit})
 	blocked := report == nil || !report.Applied || report.HistoryComplete || report.CutoverReady || report.OldBridgeAssessed
+	return finish(stdout, stderr, report, err, blocked || err != nil)
+}
+
+func cmdLegacyVerify(stdout, stderr io.Writer, args []string) int {
+	fs := newFlagSet(stderr, "legacy-verify")
+	path := fs.String("db", "", "staged GOWA chatstorage database")
+	mapping := fs.String("map", "", "legacy file to storage JID map")
+	audit := fs.String("audit", "", "private audit database; default is the staged path plus .migration-audit.db")
+	if !parseSet(fs, args, stderr) {
+		return 2
+	}
+	report, err := LegacyVerify(context.Background(), LegacyVerifyRequest{Staged: *path, MapPath: *mapping, Audit: *audit})
+	blocked := report == nil || !report.Verified || report.HistoryComplete || report.CutoverReady || report.OldBridgeAssessed
 	return finish(stdout, stderr, report, err, blocked || err != nil)
 }
 
