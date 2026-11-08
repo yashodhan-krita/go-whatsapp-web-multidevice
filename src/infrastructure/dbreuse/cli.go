@@ -24,8 +24,10 @@ It has no rest command. history_complete is false in every report.
   overlay --source DB --target DB --map FILE --work-dir DIR --out FILE [--base source|target] [--allow-live-validation]
   coverage --db FILE --archive FILE [--archive FILE ...] [--out REPORT]
   import-archive --db FILE --archive FILE [--archive FILE ...] [--account JID] [--audit FILE]
-  audit-verify --staged DB --source DB --target DB --map FILE [--audit FILE] [--base source|target]
+  audit-verify --staged DB --source DB --target DB --map FILE [--audit FILE] [--base source|target] [--retain-missing]
   legacy-schema --db FILE
+  legacy-coverage --db FILE --map FILE
+  legacy-import --db FILE --map FILE [--audit FILE]
   gate --db FILE --expect-revision SHA --attest-writers LIST [--target DB --work-dir DIR]
 
 --attest-writers must be exactly:
@@ -69,6 +71,10 @@ func runOffline(stdout, stderr io.Writer, args []string) int {
 		return cmdAuditVerify(stdout, stderr, args[1:])
 	case "legacy-schema":
 		return cmdLegacySchema(stdout, stderr, args[1:])
+	case "legacy-coverage":
+		return cmdLegacyCoverage(stdout, stderr, args[1:])
+	case "legacy-import":
+		return cmdLegacyImport(stdout, stderr, args[1:])
 	case "gate":
 		return cmdGate(stdout, stderr, args[1:])
 	default:
@@ -241,11 +247,12 @@ func cmdAuditVerify(stdout, stderr io.Writer, args []string) int {
 	mapping := fs.String("map", "", "account mapping JSON")
 	audit := fs.String("audit", "", "private audit database; default is the staged path plus .migration-audit.db")
 	base := fs.String("base", "target", "source or target, matching the overlay that wrote the staged file")
+	retain := fs.Bool("retain-missing", false, "append missing source originals to the private audit; staged rows are not modified")
 	if !parseSet(fs, args, stderr) {
 		return 2
 	}
 	report, err := AuditVerify(context.Background(), AuditVerifyRequest{
-		Staged: *staged, Source: *source, Target: *target, MapPath: *mapping, Audit: *audit, Base: *base,
+		Staged: *staged, Source: *source, Target: *target, MapPath: *mapping, Audit: *audit, Base: *base, RetainMissing: *retain,
 	})
 	blocked := report == nil || !report.Verified || report.HistoryComplete || report.CutoverReady
 	return finish(stdout, stderr, report, err, blocked || err != nil)
@@ -259,6 +266,31 @@ func cmdLegacySchema(stdout, stderr io.Writer, args []string) int {
 	}
 	report, err := InspectLegacySchema(*path)
 	blocked := report == nil || report.SessionRefused || report.HistoryComplete || report.OldBridgeAssessed || report.ImportFormatDefined
+	return finish(stdout, stderr, report, err, blocked || err != nil)
+}
+
+func cmdLegacyCoverage(stdout, stderr io.Writer, args []string) int {
+	fs := newFlagSet(stderr, "legacy-coverage")
+	path := fs.String("db", "", "staged GOWA chatstorage database")
+	mapping := fs.String("map", "", "legacy file to storage JID map")
+	if !parseSet(fs, args, stderr) {
+		return 2
+	}
+	report, err := LegacyCoverage(context.Background(), LegacyRequest{Staged: *path, MapPath: *mapping})
+	blocked := report == nil || report.HistoryComplete || report.CutoverReady || report.OldBridgeAssessed
+	return finish(stdout, stderr, report, err, blocked || err != nil)
+}
+
+func cmdLegacyImport(stdout, stderr io.Writer, args []string) int {
+	fs := newFlagSet(stderr, "legacy-import")
+	path := fs.String("db", "", "staged GOWA chatstorage database")
+	mapping := fs.String("map", "", "legacy file to storage JID map")
+	audit := fs.String("audit", "", "private audit database")
+	if !parseSet(fs, args, stderr) {
+		return 2
+	}
+	report, err := LegacyImport(context.Background(), LegacyRequest{Staged: *path, MapPath: *mapping, Audit: *audit})
+	blocked := report == nil || !report.Applied || report.HistoryComplete || report.CutoverReady || report.OldBridgeAssessed
 	return finish(stdout, stderr, report, err, blocked || err != nil)
 }
 

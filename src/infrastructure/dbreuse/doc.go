@@ -9,7 +9,10 @@
 // --base target the copy is the target registry, and mapped incoming history
 // is added onto it. import-archive inserts absent history JSON and can fill
 // empty content it previously stored. audit-verify checks that retention
-// without printing message bodies. legacy-schema reports a non-session SQLite
-// catalog and does not read rows. media-refs counts message media fields and
+// without printing message bodies and can append a missing source original to
+// the private audit. legacy-schema reports a non-session SQLite catalog and
+// does not read rows. legacy-coverage and legacy-import read a declared bridge
+// file whose hash matches the map; import appends missing messages only.
+// media-refs counts message media fields and
 // does not select local bytes.
 package dbreuse

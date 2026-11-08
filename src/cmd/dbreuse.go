@@ -296,8 +296,9 @@ func init() {
 			mapping, _ := cmd.Flags().GetString("map")
 			audit, _ := cmd.Flags().GetString("audit")
 			base, _ := cmd.Flags().GetString("base")
+			retain, _ := cmd.Flags().GetBool("retain-missing")
 			report, err := dbreuse.AuditVerify(cmd.Context(), dbreuse.AuditVerifyRequest{
-				Staged: staged, Source: source, Target: target, MapPath: mapping, Audit: audit, Base: base,
+				Staged: staged, Source: source, Target: target, MapPath: mapping, Audit: audit, Base: base, RetainMissing: retain,
 			})
 			if report != nil {
 				if writeErr := writeJSON(cmd.OutOrStdout(), report); writeErr != nil {
@@ -319,7 +320,62 @@ func init() {
 	auditVerifyCmd.Flags().String("map", "", "account mapping JSON")
 	auditVerifyCmd.Flags().String("audit", "", "private audit database")
 	auditVerifyCmd.Flags().String("base", "target", "source or target")
+	auditVerifyCmd.Flags().Bool("retain-missing", false, "append missing source originals to the private audit")
 	dbReuseCmd.AddCommand(auditVerifyCmd)
+
+	legacyCoverageCmd := &cobra.Command{
+		Use:   "legacy-coverage",
+		Short: "Compare declared legacy history files with a staged GOWA database",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			path, _ := cmd.Flags().GetString("db")
+			mapping, _ := cmd.Flags().GetString("map")
+			report, err := dbreuse.LegacyCoverage(cmd.Context(), dbreuse.LegacyRequest{Staged: path, MapPath: mapping})
+			if report != nil {
+				if writeErr := writeJSON(cmd.OutOrStdout(), report); writeErr != nil {
+					return writeErr
+				}
+			}
+			if err != nil {
+				return err
+			}
+			if report == nil || report.HistoryComplete || report.CutoverReady || report.OldBridgeAssessed {
+				return fmt.Errorf("legacy coverage was refused")
+			}
+			return nil
+		},
+	}
+	legacyCoverageCmd.Flags().String("db", "", "staged GOWA chatstorage database")
+	legacyCoverageCmd.Flags().String("map", "", "legacy file to storage JID map")
+	dbReuseCmd.AddCommand(legacyCoverageCmd)
+
+	legacyImportCmd := &cobra.Command{
+		Use:   "legacy-import",
+		Short: "Append missing legacy messages into a staged GOWA database",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			path, _ := cmd.Flags().GetString("db")
+			mapping, _ := cmd.Flags().GetString("map")
+			audit, _ := cmd.Flags().GetString("audit")
+			report, err := dbreuse.LegacyImport(cmd.Context(), dbreuse.LegacyRequest{Staged: path, MapPath: mapping, Audit: audit})
+			if report != nil {
+				if writeErr := writeJSON(cmd.OutOrStdout(), report); writeErr != nil {
+					return writeErr
+				}
+			}
+			if err != nil {
+				return err
+			}
+			if report == nil || !report.Applied || report.HistoryComplete || report.CutoverReady || report.OldBridgeAssessed {
+				return fmt.Errorf("legacy import was refused")
+			}
+			return nil
+		},
+	}
+	legacyImportCmd.Flags().String("db", "", "staged GOWA chatstorage database")
+	legacyImportCmd.Flags().String("map", "", "legacy file to storage JID map")
+	legacyImportCmd.Flags().String("audit", "", "private audit database")
+	dbReuseCmd.AddCommand(legacyImportCmd)
 
 	legacySchemaCmd := &cobra.Command{
 		Use:   "legacy-schema",

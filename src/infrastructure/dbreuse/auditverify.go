@@ -14,12 +14,13 @@ import (
 // AuditVerifyRequest checks a staged overlay against its source, target, and
 // private audit. The inputs are opened read-only.
 type AuditVerifyRequest struct {
-	Staged  string
-	Source  string
-	Target  string
-	MapPath string
-	Audit   string
-	Base    string
+	Staged        string
+	Source        string
+	Target        string
+	MapPath       string
+	Audit         string
+	Base          string
+	RetainMissing bool
 }
 
 // AuditIdentity is a message key named in a mismatch. It has no message body.
@@ -34,37 +35,44 @@ type AuditIdentity struct {
 // AuditVerifyReport is safe to print. Counts and file hashes do not include
 // message text, media keys, or filenames.
 type AuditVerifyReport struct {
-	StagedSHA256           string          `json:"staged_sha256"`
-	SourceSHA256           string          `json:"source_sha256"`
-	TargetSHA256           string          `json:"target_sha256"`
-	AuditSHA256            string          `json:"audit_sha256"`
-	Base                   string          `json:"base"`
-	StagedMessages         int             `json:"staged_messages"`
-	SourceMessages         int             `json:"source_messages"`
-	TargetMessages         int             `json:"target_messages"`
-	SourceRetained         int             `json:"source_retained"`
-	SourceMissing          int             `json:"source_missing"`
-	SourcePayloadMismatch  int             `json:"source_payload_mismatch"`
-	TargetIdentical        int             `json:"target_identical"`
-	TargetRetainedInAudit  int             `json:"target_retained_in_audit"`
-	TargetMissing          int             `json:"target_missing"`
-	PreservedTargetDevices int             `json:"preserved_target_devices"`
-	RegistryMatchesBase    bool            `json:"registry_matches_base"`
-	AuditSchemaOK          bool            `json:"audit_schema_ok"`
-	MessageVersions        int             `json:"message_versions"`
-	TargetAlternates       int             `json:"target_alternates"`
-	KeyCollisions          int             `json:"key_collisions"`
-	RelinkedCollisions     int             `json:"relinked_collisions"`
-	OrphanRows             int             `json:"orphan_rows"`
-	InventedParents        int             `json:"invented_parents"`
-	ArchiveRows            int             `json:"archive_rows"`
-	Mismatches             []AuditIdentity `json:"mismatches"`
-	Verified               bool            `json:"verified"`
-	HistoryComplete        bool            `json:"history_complete"`
-	CutoverReady           bool            `json:"cutover_ready"`
-	OldBridgeAssessed      bool            `json:"old_bridge_assessed"`
-	Reasons                []string        `json:"reasons"`
-	Notes                  []string        `json:"notes"`
+	StagedSHA256           string             `json:"staged_sha256"`
+	SourceSHA256           string             `json:"source_sha256"`
+	TargetSHA256           string             `json:"target_sha256"`
+	AuditSHA256            string             `json:"audit_sha256"`
+	Base                   string             `json:"base"`
+	StagedMessages         int                `json:"staged_messages"`
+	SourceMessages         int                `json:"source_messages"`
+	TargetMessages         int                `json:"target_messages"`
+	SourceRetained         int                `json:"source_retained"`
+	SourceMissing          int                `json:"source_missing"`
+	SourcePayloadMismatch  int                `json:"source_payload_mismatch"`
+	SourceNormalized       int                `json:"source_normalized"`
+	SourcePolicyAudited    int                `json:"source_policy_audited"`
+	SourceOriginalsMissing int                `json:"source_originals_missing"`
+	SourceUnexplained      int                `json:"source_unexplained"`
+	OriginalsRecorded      int                `json:"originals_recorded"`
+	TargetIdentical        int                `json:"target_identical"`
+	TargetNormalized       int                `json:"target_normalized"`
+	TargetRetainedInAudit  int                `json:"target_retained_in_audit"`
+	TargetMissing          int                `json:"target_missing"`
+	ColumnClasses          []ColumnClassCount `json:"column_classes"`
+	PreservedTargetDevices int                `json:"preserved_target_devices"`
+	RegistryMatchesBase    bool               `json:"registry_matches_base"`
+	AuditSchemaOK          bool               `json:"audit_schema_ok"`
+	MessageVersions        int                `json:"message_versions"`
+	TargetAlternates       int                `json:"target_alternates"`
+	KeyCollisions          int                `json:"key_collisions"`
+	RelinkedCollisions     int                `json:"relinked_collisions"`
+	OrphanRows             int                `json:"orphan_rows"`
+	InventedParents        int                `json:"invented_parents"`
+	ArchiveRows            int                `json:"archive_rows"`
+	Mismatches             []AuditIdentity    `json:"mismatches"`
+	Verified               bool               `json:"verified"`
+	HistoryComplete        bool               `json:"history_complete"`
+	CutoverReady           bool               `json:"cutover_ready"`
+	OldBridgeAssessed      bool               `json:"old_bridge_assessed"`
+	Reasons                []string           `json:"reasons"`
+	Notes                  []string           `json:"notes"`
 }
 
 // AuditVerify checks that mapped source rows survived in the staged file and
@@ -73,13 +81,17 @@ func AuditVerify(_ context.Context, req AuditVerifyRequest) (*AuditVerifyReport,
 	report := &AuditVerifyReport{
 		Base:              req.Base,
 		Mismatches:        []AuditIdentity{},
+		ColumnClasses:     []ColumnClassCount{},
 		Reasons:           []string{},
 		HistoryComplete:   false,
 		CutoverReady:      false,
 		OldBridgeAssessed: false,
 		Notes: []string{
 			"Verification compares message identity and payload. The printed report has no message text, media key, or filename.",
+			"source_payload_mismatch counts rows that are not byte-identical to the source. verified is true only when each of those rows is encoding normalization, or a named policy difference whose source original is in the private audit.",
+			"A genuine content, sender, from-me, media-key, or hash difference is not accepted. Recording its original does not clear it.",
 			"A target row that differs from the staged row must match a retained_alternate in the private audit.",
+			"--retain-missing appends missing source originals to the private audit only. It does not modify the source, target, or staged message rows.",
 			"history_complete and cutover_ready stay false. This check does not authorize a purge.",
 		},
 	}
@@ -165,7 +177,7 @@ func AuditVerify(_ context.Context, req AuditVerifyRequest) (*AuditVerifyReport,
 		return report, err
 	}
 	defer targetDB.Close()
-	auditDB, err := openSQLite(auditPath, true)
+	auditDB, err := openSQLite(auditPath, !req.RetainMissing)
 	if err != nil {
 		return report, err
 	}
@@ -213,6 +225,16 @@ func AuditVerify(_ context.Context, req AuditVerifyRequest) (*AuditVerifyReport,
 	if err != nil {
 		return report, err
 	}
+	originals, err := loadSourceOriginals(auditDB)
+	if err != nil {
+		return report, err
+	}
+	archiveFilled, err := loadImportedArchiveKeys(auditDB)
+	if err != nil {
+		return report, err
+	}
+	classCounts := map[string]int{}
+	var recordOriginals []auditMessage
 	preserved := map[string]struct{}{}
 	for _, row := range sourceRows {
 		device, chat, id, err := messageParts(row)
@@ -225,22 +247,65 @@ func AuditVerify(_ context.Context, req AuditVerifyRequest) (*AuditVerifyReport,
 			addMismatch(report, "source", device, chat, id, "unmapped_device")
 			continue
 		}
-		staged, ok := stagedByKey[baseDevice+"\x00"+chat+"\x00"+id]
+		key := baseDevice + "\x00" + chat + "\x00" + id
+		staged, ok := stagedByKey[key]
 		if !ok {
 			report.SourceMissing++
 			addMismatch(report, "source", baseDevice, chat, id, "missing")
 			continue
 		}
-		same, err := samePayload(row, staged)
+		_, filled := archiveFilled[key]
+		diffs, worst, err := classifyStagedRow(row, staged, filled)
 		if err != nil {
 			return report, err
 		}
-		if !same {
-			report.SourcePayloadMismatch++
-			addMismatch(report, "source", baseDevice, chat, id, "payload_mismatch")
-			continue
+		for _, diff := range diffs {
+			classCounts[diff.column+"\x00"+diff.class]++
 		}
-		report.SourceRetained++
+		switch worst {
+		case "identical":
+			report.SourceRetained++
+		case "normalized":
+			report.SourcePayloadMismatch++
+			report.SourceNormalized++
+		case "policy":
+			report.SourcePayloadMismatch++
+			if sourceOriginalRetained(originals[key], row) {
+				report.SourcePolicyAudited++
+			} else {
+				report.SourceOriginalsMissing++
+				recordOriginals = append(recordOriginals, auditMessage{
+					device: baseDevice, chat: chat, id: id, origin: "source", role: "raw_original", row: row,
+				})
+				if !req.RetainMissing {
+					addMismatch(report, "source", baseDevice, chat, id, "source_original_missing")
+				}
+			}
+		default:
+			report.SourcePayloadMismatch++
+			report.SourceUnexplained++
+			addMismatch(report, "source", baseDevice, chat, id, "payload_mismatch")
+			if req.RetainMissing && !sourceOriginalRetained(originals[key], row) {
+				recordOriginals = append(recordOriginals, auditMessage{
+					device: baseDevice, chat: chat, id: id, origin: "source", role: "raw_original", row: row,
+				})
+			}
+		}
+	}
+	if req.RetainMissing && len(recordOriginals) > 0 {
+		recorded, err := insertSourceOriginals(auditDB, recordOriginals)
+		if err != nil {
+			return report, err
+		}
+		report.OriginalsRecorded = recorded
+		report.SourcePolicyAudited += report.SourceOriginalsMissing
+		report.SourceOriginalsMissing = 0
+		sum, err := hashFile(auditPath)
+		if err != nil {
+			return report, err
+		}
+		report.AuditSHA256 = sum
+		report.Notes = append(report.Notes, "Source originals that were missing were appended to the private audit. Staged, source, and target message rows were not modified.")
 	}
 	for _, row := range targetRows {
 		device, chat, id, err := messageParts(row)
@@ -259,12 +324,16 @@ func AuditVerify(_ context.Context, req AuditVerifyRequest) (*AuditVerifyReport,
 			addMismatch(report, "target", device, chat, id, "missing")
 			continue
 		}
-		same, err := samePayload(row, staged)
+		_, worst, err := classifyStagedRow(row, staged, false)
 		if err != nil {
 			return report, err
 		}
-		if same {
+		if worst == "identical" {
 			report.TargetIdentical++
+			continue
+		}
+		if worst == "normalized" {
+			report.TargetNormalized++
 			continue
 		}
 		if alt, ok := alternates[stagedDevice+"\x00"+chat+"\x00"+id]; ok {
@@ -281,6 +350,7 @@ func AuditVerify(_ context.Context, req AuditVerifyRequest) (*AuditVerifyReport,
 		addMismatch(report, "target", device, chat, id, "not_in_audit")
 	}
 	report.PreservedTargetDevices = len(preserved)
+	report.ColumnClasses = columnClassCounts(classCounts)
 	if err := auditCounters(auditDB, report); err != nil {
 		return report, err
 	}
@@ -290,11 +360,103 @@ func AuditVerify(_ context.Context, req AuditVerifyRequest) (*AuditVerifyReport,
 	if report.InventedParents > 0 {
 		report.Reasons = append(report.Reasons, "audit records an invented parent message")
 	}
-	report.Verified = len(report.Reasons) == 0 && report.SourceMissing == 0 && report.SourcePayloadMismatch == 0 && report.TargetMissing == 0 && report.AuditSchemaOK && report.RegistryMatchesBase
+	if report.SourceUnexplained > 0 {
+		report.Reasons = append(report.Reasons, "staged payload differs from the source on a column the policy does not explain")
+	}
+	if report.SourceOriginalsMissing > 0 {
+		report.Reasons = append(report.Reasons, "staged primary differs from the source and the source original is not in the audit; re-run with --retain-missing")
+	}
+	report.Verified = len(report.Reasons) == 0 && report.SourceMissing == 0 && report.SourceUnexplained == 0 && report.SourceOriginalsMissing == 0 && report.TargetMissing == 0 && report.AuditSchemaOK && report.RegistryMatchesBase
 	if !report.Verified {
 		return report, fmt.Errorf("audit verify failed")
 	}
 	return report, nil
+}
+
+func loadSourceOriginals(db *sql.DB) (map[string][]string, error) {
+	rows, err := db.Query(`SELECT device_id, chat_jid, message_id, row_json FROM message_versions WHERE origin='source'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string][]string{}
+	for rows.Next() {
+		var device, chat, id, raw string
+		if err := rows.Scan(&device, &chat, &id, &raw); err != nil {
+			return nil, err
+		}
+		key := device + "\x00" + chat + "\x00" + id
+		out[key] = append(out[key], raw)
+	}
+	return out, rows.Err()
+}
+
+func loadImportedArchiveKeys(db *sql.DB) (map[string]struct{}, error) {
+	rows, err := db.Query(`SELECT device_id, chat_jid, message_id FROM archive_messages WHERE imported=1 AND reason='imported'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]struct{}{}
+	for rows.Next() {
+		var device, chat, id string
+		if err := rows.Scan(&device, &chat, &id); err != nil {
+			return nil, err
+		}
+		out[device+"\x00"+chat+"\x00"+id] = struct{}{}
+	}
+	return out, rows.Err()
+}
+
+func sourceOriginalRetained(raws []string, row sqlRow) bool {
+	for _, raw := range raws {
+		match, err := auditJSONMatchesRow(raw, row)
+		if err == nil && match {
+			return true
+		}
+	}
+	return false
+}
+
+func insertSourceOriginals(db *sql.DB, messages []auditMessage) (int, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	for _, message := range messages {
+		raw, err := privateRowJSON(message.row)
+		if err != nil {
+			tx.Rollback()
+			return 0, err
+		}
+		if _, err := tx.Exec(`INSERT INTO message_versions (device_id, chat_jid, message_id, origin, role, row_json) VALUES (?, ?, ?, ?, ?, ?)`,
+			message.device, message.chat, message.id, message.origin, message.role, raw); err != nil {
+			tx.Rollback()
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return len(messages), nil
+}
+
+func columnClassCounts(counts map[string]int) []ColumnClassCount {
+	var out []ColumnClassCount
+	for key, count := range counts {
+		column, class, _ := strings.Cut(key, "\x00")
+		out = append(out, ColumnClassCount{Column: column, Class: class, Rows: count})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Column == out[j].Column {
+			return out[i].Class < out[j].Class
+		}
+		return out[i].Column < out[j].Column
+	})
+	if out == nil {
+		return []ColumnClassCount{}
+	}
+	return out
 }
 
 func addMismatch(report *AuditVerifyReport, side, device, chat, id, problem string) {

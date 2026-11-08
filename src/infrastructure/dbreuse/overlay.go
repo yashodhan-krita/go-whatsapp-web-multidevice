@@ -658,6 +658,18 @@ func buildOverlayPlan(report *OverlayReport, srcDB, dstDB queryer, accounts []ve
 			}
 			continue
 		}
+		if baseName == "target" && len(diffs) > 0 {
+			retainRawOriginal(plan, row, sourceDevice, chat, id)
+		}
+		if len(fills) > 0 {
+			origin, role := "target", "retained_alternate"
+			if baseName == "source" {
+				origin, role = "source", "raw_original"
+			}
+			plan.auditMessages = append(plan.auditMessages, auditMessage{
+				device: sourceDevice, chat: chat, id: id, origin: origin, role: role, row: existing,
+			})
+		}
 		plan.fills = append(plan.fills, fills...)
 		report.AlreadyPresent++
 	}
@@ -1220,6 +1232,12 @@ func updateRow(tx *sql.Tx, update rowUpdate) error {
 		return fmt.Errorf("update %s matched %d rows", update.table, n)
 	}
 	return nil
+}
+
+func retainRawOriginal(plan *planned, sourceRow sqlRow, device, chat, id string) {
+	plan.auditMessages = append(plan.auditMessages, auditMessage{
+		device: device, chat: chat, id: id, origin: "source", role: "raw_original", row: sourceRow,
+	})
 }
 
 func retainBoth(plan *planned, baseRow, incoming sqlRow, baseName, device, chat, id string) {

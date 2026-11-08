@@ -260,6 +260,12 @@ not given a guessed sender. `sender_unresolved_shapes` counts that case by
 chat server and which participant fields were present. The raw object stays
 in the audit.
 
+The remaining unresolved group rows have the shape
+`from_me=false;key_participant=absent;info_participant=absent;chat=g.us`.
+Both supported participant fields are absent. Those messages cannot be
+inserted. The raw archive object stays in the private audit. No sender is
+invented for them.
+
 ```sh
 ./db-reuse-linux-amd64 audit-verify \
   --staged /absolute/path/to/work/staged.db \
@@ -271,11 +277,64 @@ in the audit.
 
 `audit-verify` reads the staged file, both inputs, the account map, and the
 private audit. It checks the audit tables and policy, file hashes, and that
-every mapped source message is in the staged file with the same payload.
-Every target message is either still the same payload or present as a
-retained alternate. The printed JSON has counts and hashes, not message
-text or media keys. `verified` true does not set `history_complete` or
-`cutover_ready`.
+every mapped source message is in the staged file. `source_payload_mismatch`
+counts rows that are not byte-identical. `column_classes` names the column
+and the class, with no values. Encoding differences (boolean and integer,
+the same timestamp instant, empty null and empty text) are normalization.
+`created_at`, `updated_at`, and a kept base timestamp are policy differences.
+An empty source metadata column left as the staged value is
+`enrichment_kept_base`. Empty content filled from an archive row this
+importer inserted is `archive_text_fill`. Each of those needs the source
+original in the private audit. A difference in content, sender, from-me,
+media key, or file hash that is not one of those classes stays unexplained
+and `verified` stays false. `--retain-missing` appends a missing source
+original to the private audit and does not modify the source, target, or
+staged message rows. Recording an original does not accept an unexplained
+difference. Every target message is either still the same payload, a
+normalization of it, or present as a retained alternate. The printed JSON
+has counts and hashes, not message text or media keys. `verified` true does
+not set `history_complete` or `cutover_ready`.
+
+```sh
+./db-reuse-linux-amd64 legacy-coverage \
+  --db /absolute/path/to/work/staged.db \
+  --map /absolute/path/to/work/legacy-accounts.json
+
+./db-reuse-linux-amd64 legacy-import \
+  --db /absolute/path/to/work/staged.db \
+  --map /absolute/path/to/work/legacy-accounts.json
+```
+
+`legacy-accounts.json` is a caller declaration, not something read from the
+legacy file:
+
+```json
+{"accounts":[{"label":"legacy-a","source_path":"/absolute/path/to/legacy-a.db","source_sha256":"<64 hex chars>","target_storage_jid":"<registry storage JID>"}]}
+```
+
+The legacy messages table has no device id. The import uses
+`target_storage_jid` only when it is exactly one registry storage id and the
+file hash matches `source_sha256`. A slot UUID, an AD JID, or a guessed LID
+is refused. Message identity is that account plus `chat_jid` plus `id`. A
+broadcast or newsletter chat is inserted with the others. A row that is
+already in GOWA stays the primary, and the full legacy row is kept in the
+private audit table `legacy_rows`. Columns GOWA does not have, such as quoted
+text and sender name, stay in that raw row and are not added to GOWA.
+
+A new row copies `filename`, `url`, `direct_path`, `media_key`, the file
+hashes, and `file_length` so a later media pass can resolve the source path.
+Media bytes are not copied. A group, broadcast, or newsletter message with
+an empty sender is not inserted. `sender_name` is not used as a sender.
+`limitations` states that count. A timestamp with a zone is stored as UTC.
+A timestamp with no zone keeps that clock and increments `zone_unspecified`;
+no zone is invented. An unparseable timestamp is not inserted.
+
+Poll options, poll votes, and contact nicknames are retained in the private
+audit and are not turned into `poll_definitions` or chat names. Webhook
+tables are counted only. Their URLs, secrets, and payloads are not read.
+`old_bridge_assessed` stays false: these declared files are not full history.
+`history_complete` and `cutover_ready` stay false. The legacy files are
+opened read-only.
 
 ```sh
 ./db-reuse-linux-amd64 legacy-schema \
@@ -283,7 +342,8 @@ text or media keys. `verified` true does not set `history_complete` or
 ```
 
 `legacy-schema` reports table, column, and index names, types, and row
-counts. It does not select row values and it does not define an import.
+counts. It does not select row values. `legacy-coverage` and `legacy-import`
+are the adapter for the bridge shape those reports describe.
 `snapshot` can copy that file with the SQLite backup API when it is not a
 GOWA chatstorage database; the copy is not a cutover file. A `whatsapp.db`,
 `session.db`, `keys.db`, or any database with a WhatsApp session or key

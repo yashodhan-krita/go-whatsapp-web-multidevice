@@ -257,6 +257,11 @@ func ImportArchives(req ImportRequest) (*ImportReport, error) {
 		return report, err
 	}
 	report.SenderUnresolvedShapes = shapeCounts(senderShapes)
+	for _, shape := range report.SenderUnresolvedShapes {
+		if shape.Shape == "from_me=false;key_participant=absent;info_participant=absent;chat=g.us" && shape.Count > 0 {
+			report.Notes = append(report.Notes, "Group messages with fromMe false and neither key.participant nor message.participant have no supported sender. They are not inserted and no sender is invented. The raw object stays in the private audit.")
+		}
+	}
 	report.TextUnresolvedShapes = shapeCounts(textShapes)
 	report.HistoryComplete = false
 	report.OldBridgeAssessed = false
