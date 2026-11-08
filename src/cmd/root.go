@@ -76,7 +76,7 @@ func init() {
 	// Then initialize other components. Cobra marks the target command as called
 	// before running initializers, so `version` can skip config and storage setup.
 	cobra.OnInitialize(func() {
-		if versionCmd.CalledAs() != "" {
+		if skipsStorageInit() {
 			return
 		}
 		initEnvConfig()
@@ -752,6 +752,20 @@ func initApp() {
 		case <-time.After(10 * time.Second):
 		}
 	}
+}
+
+// skipsStorageInit keeps read-only maintenance commands from opening WhatsApp
+// sessions, creating storage directories, or printing loaded configuration.
+func skipsStorageInit() bool {
+	if versionCmd.CalledAs() != "" || dbReuseCmd.CalledAs() != "" {
+		return true
+	}
+	for _, child := range dbReuseCmd.Commands() {
+		if child.CalledAs() != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // Execute adds all child commands to the root command and sets flags appropriately.
