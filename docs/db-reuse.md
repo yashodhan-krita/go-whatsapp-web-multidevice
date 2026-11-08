@@ -241,11 +241,54 @@ Do not purge a bridge, archive, or target snapshot from this report.
 Absent archive messages can be inserted into the staged snapshot. The
 account is the filename JID when it matches one registry storage id, or
 `--account` when the filename has no JID. A filename JID that matches a
-different account is refused. Rows that already exist for that account,
-chat, and id are left unchanged. The raw history object is appended to the
-private audit. Metadata-only files add nothing and are not proof. A legacy
-dry run of 908 keys, excluding broadcasts and newsletters, is not full
-legacy history; the old bridge still needs its own export and account map.
+different account is refused. A non-empty row is left unchanged. A row this
+importer already inserted with empty content is filled when the archive now
+decodes supported text. The raw history object stays in the private audit.
+Metadata-only files add nothing and are not proof.
+
+Supported text is the history message's own conversation, extended text,
+media caption, template or button text, contact, location, poll name, or
+edit payload, including an inner message inside an ephemeral, view-once,
+document-with-caption, comment, or album-child wrapper. Quoted text is not
+copied into the row. A field that is not one of those stays only in the
+audit. `text_unresolved_shapes` counts the protobuf fields of those objects.
+
+Sender is `fromMe`, then `key.participant`, then the message's own
+`participant`. A direct chat can use its chat JID. A group, broadcast, or
+newsletter without one of those participant fields is not inserted and is
+not given a guessed sender. `sender_unresolved_shapes` counts that case by
+chat server and which participant fields were present. The raw object stays
+in the audit.
+
+```sh
+./db-reuse-linux-amd64 audit-verify \
+  --staged /absolute/path/to/work/staged.db \
+  --source /absolute/path/to/work/mac-snapshot.db \
+  --target /absolute/path/to/work/box-snapshot.db \
+  --map /absolute/path/to/work/accounts.json \
+  --base target
+```
+
+`audit-verify` reads the staged file, both inputs, the account map, and the
+private audit. It checks the audit tables and policy, file hashes, and that
+every mapped source message is in the staged file with the same payload.
+Every target message is either still the same payload or present as a
+retained alternate. The printed JSON has counts and hashes, not message
+text or media keys. `verified` true does not set `history_complete` or
+`cutover_ready`.
+
+```sh
+./db-reuse-linux-amd64 legacy-schema \
+  --db /absolute/path/to/work/messages.db
+```
+
+`legacy-schema` reports table, column, and index names, types, and row
+counts. It does not select row values and it does not define an import.
+`snapshot` can copy that file with the SQLite backup API when it is not a
+GOWA chatstorage database; the copy is not a cutover file. A `whatsapp.db`,
+`session.db`, `keys.db`, or any database with a WhatsApp session or key
+table is refused. `old_bridge_assessed` stays false. A legacy dry run of
+908 keys, excluding broadcasts and newsletters, is not full legacy history.
 
 ```sh
 ./db-reuse-linux-amd64 import-archive \

@@ -17,7 +17,7 @@ var dbReuseCmd = &cobra.Command{
 	Long: `Check whether a GOWA chatstorage.db can be opened by official v9.9.0.
 
 The subcommands do not connect to WhatsApp, send messages, mark chats read,
-import history archives, open whatsapp.db, or delete rows. snapshot writes one
+import an unknown bridge, open whatsapp.db, or delete rows. snapshot writes one
 consistent database file, including an open WAL. preflight reports schema and
 registry alignment. gate blocks a real cutover unless the on-disk schema matches
 the verified Mac revision and the writers were attested frozen. reconcile lists
@@ -284,6 +284,66 @@ func init() {
 	importCmd.Flags().String("audit", "", "private audit database")
 	importCmd.Flags().StringArray("archive", nil, "history-sync JSON file")
 	dbReuseCmd.AddCommand(importCmd)
+
+	auditVerifyCmd := &cobra.Command{
+		Use:   "audit-verify",
+		Short: "Check staged history against the source, target, and private audit",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			staged, _ := cmd.Flags().GetString("staged")
+			source, _ := cmd.Flags().GetString("source")
+			target, _ := cmd.Flags().GetString("target")
+			mapping, _ := cmd.Flags().GetString("map")
+			audit, _ := cmd.Flags().GetString("audit")
+			base, _ := cmd.Flags().GetString("base")
+			report, err := dbreuse.AuditVerify(cmd.Context(), dbreuse.AuditVerifyRequest{
+				Staged: staged, Source: source, Target: target, MapPath: mapping, Audit: audit, Base: base,
+			})
+			if report != nil {
+				if writeErr := writeJSON(cmd.OutOrStdout(), report); writeErr != nil {
+					return writeErr
+				}
+			}
+			if err != nil {
+				return err
+			}
+			if report == nil || !report.Verified || report.HistoryComplete || report.CutoverReady {
+				return fmt.Errorf("audit verify failed")
+			}
+			return nil
+		},
+	}
+	auditVerifyCmd.Flags().String("staged", "", "staged chatstorage database")
+	auditVerifyCmd.Flags().String("source", "", "source snapshot")
+	auditVerifyCmd.Flags().String("target", "", "target snapshot")
+	auditVerifyCmd.Flags().String("map", "", "account mapping JSON")
+	auditVerifyCmd.Flags().String("audit", "", "private audit database")
+	auditVerifyCmd.Flags().String("base", "target", "source or target")
+	dbReuseCmd.AddCommand(auditVerifyCmd)
+
+	legacySchemaCmd := &cobra.Command{
+		Use:   "legacy-schema",
+		Short: "Report a SQLite history database's tables without reading rows",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			path, _ := cmd.Flags().GetString("db")
+			report, err := dbreuse.InspectLegacySchema(path)
+			if report != nil {
+				if writeErr := writeJSON(cmd.OutOrStdout(), report); writeErr != nil {
+					return writeErr
+				}
+			}
+			if err != nil {
+				return err
+			}
+			if report == nil || report.SessionRefused || report.HistoryComplete || report.OldBridgeAssessed || report.ImportFormatDefined {
+				return fmt.Errorf("legacy schema inspection was refused")
+			}
+			return nil
+		},
+	}
+	legacySchemaCmd.Flags().String("db", "", "SQLite history database, such as messages.db")
+	dbReuseCmd.AddCommand(legacySchemaCmd)
 
 	coverageCmd.Flags().String("db", "", "chatstorage snapshot")
 	coverageCmd.Flags().StringArray("archive", nil, "history-sync JSON file")

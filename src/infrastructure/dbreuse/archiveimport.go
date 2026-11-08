@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -22,40 +23,54 @@ type ImportRequest struct {
 
 // ImportReport is safe to print. Message bodies stay in the audit file.
 type ImportReport struct {
-	Database                string   `json:"database"`
-	AuditPath               string   `json:"audit_path"`
-	Account                 string   `json:"account"`
-	Imported                int      `json:"imported"`
-	AlreadyPresent          int      `json:"already_present"`
-	DistinctOtherChat       int      `json:"distinct_other_chat"`
-	SkippedMetadataOnly     int      `json:"skipped_metadata_only"`
-	SkippedEmpty            int      `json:"skipped_empty_conversations"`
-	SenderUnresolved        int      `json:"sender_unresolved"`
-	TimestampUnresolved     int      `json:"timestamp_unresolved"`
-	TextExtracted           int      `json:"text_extracted"`
-	TextRetainedOnlyInAudit int      `json:"text_retained_only_in_audit"`
-	ChatsAdded              int      `json:"chats_added"`
-	HistoryComplete         bool     `json:"history_complete"`
-	HistoryCompleteReason   string   `json:"history_complete_reason"`
-	OldBridgeAssessed       bool     `json:"old_bridge_assessed"`
-	MetadataOnlyIsProof     bool     `json:"metadata_only_is_proof"`
-	Notes                   []string `json:"notes"`
+	Database                string       `json:"database"`
+	AuditPath               string       `json:"audit_path"`
+	Account                 string       `json:"account"`
+	Imported                int          `json:"imported"`
+	AlreadyPresent          int          `json:"already_present"`
+	DistinctOtherChat       int          `json:"distinct_other_chat"`
+	SkippedMetadataOnly     int          `json:"skipped_metadata_only"`
+	SkippedEmpty            int          `json:"skipped_empty_conversations"`
+	SenderUnresolved        int          `json:"sender_unresolved"`
+	TimestampUnresolved     int          `json:"timestamp_unresolved"`
+	TextExtracted           int          `json:"text_extracted"`
+	TextFilled              int          `json:"text_filled"`
+	TextRetainedOnlyInAudit int          `json:"text_retained_only_in_audit"`
+	SenderUnresolvedShapes  []ShapeCount `json:"sender_unresolved_shapes"`
+	TextUnresolvedShapes    []ShapeCount `json:"text_unresolved_shapes"`
+	ChatsAdded              int          `json:"chats_added"`
+	HistoryComplete         bool         `json:"history_complete"`
+	HistoryCompleteReason   string       `json:"history_complete_reason"`
+	OldBridgeAssessed       bool         `json:"old_bridge_assessed"`
+	MetadataOnlyIsProof     bool         `json:"metadata_only_is_proof"`
+	Notes                   []string     `json:"notes"`
+}
+
+// ShapeCount is a structural fingerprint. It names protobuf fields and sender
+// presence. It does not include message text, JIDs, or media keys.
+type ShapeCount struct {
+	Shape string `json:"shape"`
+	Count int    `json:"count"`
 }
 
 // ImportArchives inserts history JSON messages that are absent for the
 // account's (chat, id) pair. It does not overwrite a row that is already staged.
 func ImportArchives(req ImportRequest) (*ImportReport, error) {
 	report := &ImportReport{
-		Database:              req.DB,
-		HistoryComplete:       false,
-		OldBridgeAssessed:     false,
-		MetadataOnlyIsProof:   false,
-		HistoryCompleteReason: historyCompleteNote + " Imported archive ids are not complete history. A legacy dry run of 908 keys, excluding broadcasts and newsletters, is not full legacy coverage. Old-bridge SQLite still needs its own export and account map. This does not authorize a purge.",
+		Database:               req.DB,
+		HistoryComplete:        false,
+		OldBridgeAssessed:      false,
+		MetadataOnlyIsProof:    false,
+		HistoryCompleteReason:  historyCompleteNote + " Imported archive ids are not complete history. A legacy dry run of 908 keys, excluding broadcasts and newsletters, is not full legacy coverage. Old-bridge SQLite still needs its own export and account map. This does not authorize a purge.",
+		SenderUnresolvedShapes: []ShapeCount{},
+		TextUnresolvedShapes:   []ShapeCount{},
 		Notes: []string{
 			"Only a missing (account, chat, message id) row is inserted. An id that already exists under another chat is inserted for this chat and is not merged.",
+			"A row this importer already inserted with empty content is filled when supported text can now be decoded. A non-empty row is left unchanged.",
 			"The raw history message is stored in the private audit. This report does not include it.",
 			"Metadata-only history files add no messages and are not proof of coverage.",
-			"No LID mapping is invented. Sender is taken from fromMe, participant, or the chat JID.",
+			"Sender comes from fromMe, key.participant, or the message participant. A direct chat can use its chat JID. A group, broadcast, or newsletter without a participant is not given a guessed sender, and the raw object stays in the audit.",
+			"sender_unresolved_shapes and text_unresolved_shapes count structural fields of objects that are still absent or still have no ordinary text. They are not message bodies.",
 			historyCompleteNote,
 		},
 	}
@@ -98,6 +113,12 @@ func ImportArchives(req ImportRequest) (*ImportReport, error) {
 	if err != nil {
 		return report, err
 	}
+	importedBefore, err := importedArchiveKeys(auditPath)
+	if err != nil {
+		return report, err
+	}
+	senderShapes := map[string]int{}
+	textShapes := map[string]int{}
 	tx, err := db.Begin()
 	if err != nil {
 		return report, err
@@ -129,6 +150,39 @@ func ImportArchives(req ImportRequest) (*ImportReport, error) {
 				return report, err
 			}
 			if exists {
+				key := account + "\x00" + decision.chat + "\x00" + decision.id
+				_, imported := importedBefore[key]
+				if imported && decision.skip == "" && decision.textExtracted {
+					result, err := tx.Exec(`UPDATE messages SET content=? WHERE device_id=? AND chat_jid=? AND id=? AND (content IS NULL OR content='')`, decision.content, account, decision.chat, decision.id)
+					if err != nil {
+						tx.Rollback()
+						return report, err
+					}
+					updated, err := result.RowsAffected()
+					if err != nil {
+						tx.Rollback()
+						return report, err
+					}
+					if updated == 1 {
+						report.TextFilled++
+						report.TextExtracted++
+						if err := appendArchiveAudit(auditPath, path, sum, account, decision.chat, decision.id, "text_filled", true, string(payload.Raw)); err != nil {
+							tx.Rollback()
+							return report, err
+						}
+						continue
+					}
+				}
+				if imported && decision.skip == "" && !decision.textExtracted {
+					empty, err := stagedContentEmpty(tx, account, decision.chat, decision.id)
+					if err != nil {
+						tx.Rollback()
+						return report, err
+					}
+					if empty {
+						textShapes[decision.textShape]++
+					}
+				}
 				report.AlreadyPresent++
 				if err := appendArchiveAudit(auditPath, path, sum, account, decision.chat, decision.id, "already_present", false, string(payload.Raw)); err != nil {
 					tx.Rollback()
@@ -145,8 +199,15 @@ func ImportArchives(req ImportRequest) (*ImportReport, error) {
 				switch decision.skip {
 				case "sender_unresolved":
 					report.SenderUnresolved++
+					senderShapes[decision.senderShape]++
+					if !decision.textExtracted {
+						textShapes[decision.textShape]++
+					}
 				case "timestamp_unresolved":
 					report.TimestampUnresolved++
+					if !decision.textExtracted {
+						textShapes[decision.textShape]++
+					}
 				}
 				if err := appendArchiveAudit(auditPath, path, sum, account, decision.chat, decision.id, decision.skip, false, string(payload.Raw)); err != nil {
 					tx.Rollback()
@@ -175,6 +236,7 @@ func ImportArchives(req ImportRequest) (*ImportReport, error) {
 				report.TextExtracted++
 			} else {
 				report.TextRetainedOnlyInAudit++
+				textShapes[decision.textShape]++
 			}
 			if err := appendArchiveAudit(auditPath, path, sum, account, decision.chat, decision.id, "imported", true, string(payload.Raw)); err != nil {
 				tx.Rollback()
@@ -194,6 +256,8 @@ func ImportArchives(req ImportRequest) (*ImportReport, error) {
 	if err := tx.Commit(); err != nil {
 		return report, err
 	}
+	report.SenderUnresolvedShapes = shapeCounts(senderShapes)
+	report.TextUnresolvedShapes = shapeCounts(textShapes)
 	report.HistoryComplete = false
 	report.OldBridgeAssessed = false
 	report.MetadataOnlyIsProof = false
@@ -208,6 +272,8 @@ type projectedMessage struct {
 	timestamp     string
 	fromMe        int
 	textExtracted bool
+	textShape     string
+	senderShape   string
 	skip          string
 }
 
@@ -228,30 +294,45 @@ func projectArchiveMessage(payload archivePayload, account string) (projectedMes
 	if err := json.Unmarshal(payload.Raw, &body); err != nil {
 		return out, fmt.Errorf("archive message %s: %w", payload.ID, err)
 	}
+	var envelope map[string]json.RawMessage
+	_ = json.Unmarshal(payload.Raw, &envelope)
+	infoParticipant := ""
+	if messageObj, ok := envelope["message"]; ok {
+		var info map[string]json.RawMessage
+		if json.Unmarshal(messageObj, &info) == nil {
+			infoParticipant, _ = jsonString(info, "participant")
+		}
+	}
+	fromMe := false
+	if body.Message.Key.FromMe != nil {
+		fromMe = *body.Message.Key.FromMe
+	}
+	keyHadParticipant := body.Message.Key.Participant != ""
+	if !keyHadParticipant && infoParticipant != "" {
+		body.Message.Key.Participant = infoParticipant
+	}
+	out.senderShape = senderShape(fromMe, keyHadParticipant, infoParticipant != "", out.chat)
+	out.textShape = archiveTextShape(body.Message.Message)
 	seconds, ok := unixSeconds(body.Message.MessageTimestamp)
 	if !ok {
 		out.skip = "timestamp_unresolved"
 		return out, nil
 	}
 	out.timestamp = time.Unix(seconds, 0).UTC().Format("2006-01-02 15:04:05")
-	fromMe := false
-	if body.Message.Key.FromMe != nil {
-		fromMe = *body.Message.Key.FromMe
+	if text, ok := archiveMessageText(body.Message.Message); ok {
+		out.content = text
+		out.textExtracted = true
 	}
 	if fromMe {
 		out.fromMe = 1
 		out.sender = account
 	} else if body.Message.Key.Participant != "" {
 		out.sender = body.Message.Key.Participant
-	} else if out.chat != "" && !strings.Contains(out.chat, "@g.us") && !strings.Contains(out.chat, "@broadcast") && !strings.Contains(out.chat, "@newsletter") {
+	} else if directChat(out.chat) {
 		out.sender = out.chat
 	} else {
 		out.skip = "sender_unresolved"
 		return out, nil
-	}
-	if text, ok := archiveText(body.Message.Message); ok {
-		out.content = text
-		out.textExtracted = true
 	}
 	return out, nil
 }
@@ -266,27 +347,6 @@ func unixSeconds(raw json.RawMessage) (int64, bool) {
 		return 0, false
 	}
 	return seconds, true
-}
-
-func archiveText(message map[string]json.RawMessage) (string, bool) {
-	if message == nil {
-		return "", false
-	}
-	if raw, ok := message["conversation"]; ok {
-		var text string
-		if err := json.Unmarshal(raw, &text); err == nil {
-			return text, true
-		}
-	}
-	if raw, ok := message["extendedTextMessage"]; ok {
-		var extended struct {
-			Text string `json:"text"`
-		}
-		if err := json.Unmarshal(raw, &extended); err == nil && extended.Text != "" {
-			return extended.Text, true
-		}
-	}
-	return "", false
 }
 
 func messagePairExists(q queryer, device, chat, id string) (bool, error) {
@@ -311,6 +371,59 @@ func ensureChat(tx *sql.Tx, device, chat, stamp string) (bool, error) {
 	}
 	_, err := tx.Exec(`INSERT INTO chats (jid, device_id, name, last_message_time) VALUES (?, ?, '', ?)`, chat, device, stamp)
 	return err == nil, err
+}
+
+func stagedContentEmpty(q queryer, device, chat, id string) (bool, error) {
+	var content sql.NullString
+	err := q.QueryRow(`SELECT content FROM messages WHERE device_id=? AND chat_jid=? AND id=?`, device, chat, id).Scan(&content)
+	if err != nil {
+		return false, err
+	}
+	return !content.Valid || content.String == "", nil
+}
+
+func importedArchiveKeys(path string) (map[string]struct{}, error) {
+	out := map[string]struct{}{}
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return out, nil
+		}
+		return nil, err
+	}
+	db, err := openSQLite(path, true)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	rows, err := db.Query(`SELECT device_id, chat_jid, message_id FROM archive_messages WHERE imported=1 AND reason='imported'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var device, chat, id string
+		if err := rows.Scan(&device, &chat, &id); err != nil {
+			return nil, err
+		}
+		out[device+"\x00"+chat+"\x00"+id] = struct{}{}
+	}
+	return out, rows.Err()
+}
+
+func shapeCounts(counts map[string]int) []ShapeCount {
+	if len(counts) == 0 {
+		return []ShapeCount{}
+	}
+	keys := make([]string, 0, len(counts))
+	for key := range counts {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	out := make([]ShapeCount, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, ShapeCount{Shape: key, Count: counts[key]})
+	}
+	return out
 }
 
 func ensureAudit(path string) error {

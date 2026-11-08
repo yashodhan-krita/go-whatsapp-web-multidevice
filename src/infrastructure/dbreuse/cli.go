@@ -24,6 +24,8 @@ It has no rest command. history_complete is false in every report.
   overlay --source DB --target DB --map FILE --work-dir DIR --out FILE [--base source|target] [--allow-live-validation]
   coverage --db FILE --archive FILE [--archive FILE ...] [--out REPORT]
   import-archive --db FILE --archive FILE [--archive FILE ...] [--account JID] [--audit FILE]
+  audit-verify --staged DB --source DB --target DB --map FILE [--audit FILE] [--base source|target]
+  legacy-schema --db FILE
   gate --db FILE --expect-revision SHA --attest-writers LIST [--target DB --work-dir DIR]
 
 --attest-writers must be exactly:
@@ -63,6 +65,10 @@ func runOffline(stdout, stderr io.Writer, args []string) int {
 		return cmdCoverage(stdout, stderr, args[1:])
 	case "import-archive":
 		return cmdImport(stdout, stderr, args[1:])
+	case "audit-verify":
+		return cmdAuditVerify(stdout, stderr, args[1:])
+	case "legacy-schema":
+		return cmdLegacySchema(stdout, stderr, args[1:])
 	case "gate":
 		return cmdGate(stdout, stderr, args[1:])
 	default:
@@ -224,6 +230,35 @@ func cmdImport(stdout, stderr io.Writer, args []string) int {
 	}
 	report, err := ImportArchives(ImportRequest{DB: *path, Account: *account, Audit: *audit, Archives: archives})
 	blocked := report == nil || report.HistoryComplete || report.OldBridgeAssessed || report.MetadataOnlyIsProof
+	return finish(stdout, stderr, report, err, blocked || err != nil)
+}
+
+func cmdAuditVerify(stdout, stderr io.Writer, args []string) int {
+	fs := newFlagSet(stderr, "audit-verify")
+	staged := fs.String("staged", "", "staged chatstorage database")
+	source := fs.String("source", "", "source snapshot")
+	target := fs.String("target", "", "target snapshot")
+	mapping := fs.String("map", "", "account mapping JSON")
+	audit := fs.String("audit", "", "private audit database; default is the staged path plus .migration-audit.db")
+	base := fs.String("base", "target", "source or target, matching the overlay that wrote the staged file")
+	if !parseSet(fs, args, stderr) {
+		return 2
+	}
+	report, err := AuditVerify(context.Background(), AuditVerifyRequest{
+		Staged: *staged, Source: *source, Target: *target, MapPath: *mapping, Audit: *audit, Base: *base,
+	})
+	blocked := report == nil || !report.Verified || report.HistoryComplete || report.CutoverReady
+	return finish(stdout, stderr, report, err, blocked || err != nil)
+}
+
+func cmdLegacySchema(stdout, stderr io.Writer, args []string) int {
+	fs := newFlagSet(stderr, "legacy-schema")
+	path := fs.String("db", "", "SQLite history database, such as messages.db")
+	if !parseSet(fs, args, stderr) {
+		return 2
+	}
+	report, err := InspectLegacySchema(*path)
+	blocked := report == nil || report.SessionRefused || report.HistoryComplete || report.OldBridgeAssessed || report.ImportFormatDefined
 	return finish(stdout, stderr, report, err, blocked || err != nil)
 }
 

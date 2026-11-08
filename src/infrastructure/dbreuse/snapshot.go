@@ -23,6 +23,7 @@ type SnapshotResult struct {
 	SourceSHM       bool     `json:"source_shm"`
 	WritersAttested []string `json:"writers_attested"`
 	LiveValidation  bool     `json:"live_validation"`
+	LegacySchema    bool     `json:"legacy_schema"`
 	CutoverReady    bool     `json:"cutover_ready"`
 	HistoryComplete bool     `json:"history_complete"`
 	Reasons         []string `json:"reasons"`
@@ -65,6 +66,25 @@ func SnapshotWithOptions(ctx context.Context, src, dst string, opt SnapshotOptio
 	}
 	if shm && len(writers) > 0 {
 		return result, fmt.Errorf("refusing a freeze attestation while %s-shm exists; a writer is still connected", src)
+	}
+	legacy, err := legacySQLite(src)
+	if err != nil {
+		return result, err
+	}
+	if legacy {
+		if shm && !opt.AllowLiveValidation {
+			return result, fmt.Errorf("source -shm exists; pass allow-live-validation for a non-cutover copy")
+		}
+		if err := snapshot(ctx, src, dst); err != nil {
+			return result, err
+		}
+		result.Path = dst
+		result.LegacySchema = true
+		result.LiveValidation = opt.AllowLiveValidation
+		result.Reasons = append(result.Reasons, "legacy snapshot is a consistent copy of a non-chatstorage SQLite file. It exports no rows, it is not a GOWA cutover file, and it does not prove old-bridge coverage.")
+		result.CutoverReady = false
+		result.HistoryComplete = false
+		return result, nil
 	}
 	if shm && !opt.AllowLiveValidation {
 		return result, fmt.Errorf("source -shm exists; stop source GOWA, the periodic merge writer, and target GOWA before a cutover snapshot, or pass allow-live-validation for a non-cutover copy")
